@@ -1,0 +1,125 @@
+# horizon-tab: TAB (tab list, name tags, sorting, objectives, scoreboard, boss bars) and a
+# placeholder registry, as a Horizon native mod (horizon-mixins bundle).
+# Written blind (no engine build yet): every target below was read from the Horizon source at the
+# pinned revision; see STATUS.md for what to check first.
+
+[mod]
+id = "tab"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "a589a3dd9be04fa7f17667c0175711aaa92e1147"
+
+# The logic, free of game types (unit tested on its own). A dependency of horizon-client-lib, so
+# the hub's code (player_info) and the game's code (through the modules below) both reach it.
+[[crate]]
+id = "core"
+path = "core"
+dependent = "horizon-client-lib"
+
+# `horizon_client::tab`: the core's API for the game's helpers and for other mods.
+[[module]]
+id = "api-tab"
+file = "crates/horizon-client/src/client_lib.rs"
+name = "tab"
+source = "helpers/api_tab.rs"
+visibility = "pub"
+
+# `horizon_client::placeholders`: the placeholder registry other mods register into.
+[[module]]
+id = "api-placeholders"
+file = "crates/horizon-client/src/client_lib.rs"
+name = "placeholders"
+source = "helpers/api_placeholders.rs"
+visibility = "pub"
+
+# `crate::game::tab_glue`: reads the game state, turns the core's packets into protocol packets.
+[[module]]
+id = "glue"
+file = "crates/horizon-client/src/game.rs"
+name = "tab_glue"
+source = "helpers/glue.rs"
+
+# The server starts: default files, load config/tab/.
+[[injection]]
+id = "start"
+hook = "server_about_to_start"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/start.rs"
+bindings = [{ name = "dedicated", ty = "bool", value = "dedicated" }]
+
+# Every tick: players and server to the core, its packets out.
+[[injection]]
+id = "tick"
+hook = "tick"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/tick.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
+
+# The server stops: take away what TAB showed.
+[[injection]]
+id = "stopping"
+hook = "server_stopping"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/stopping.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
+
+[[injection]]
+id = "register-commands"
+hook = "register_commands"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/register_commands.rs"
+bindings = [{ name = "commands", ty = "&mut Vec<horizon_client::mod_api::NativeCommand>", value = "&mut *commands" }]
+
+[[injection]]
+id = "perform-command"
+hook = "perform_command"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/perform_command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "&horizon_client::mod_api::NativeServerPlayer", value = "player" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
+[[injection]]
+id = "console-command"
+hook = "perform_console_command"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/console_command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
+# Anti-override: TAB's team, display name, ping and game mode values are put back in packets other
+# senders (a datapack's `/team`, vanilla's latency update) send a viewer. `native_server_packet` has
+# no catalog name, so it is a raw target; `tick.rs` switches the hook on with `native_watch_server_packets`.
+[[injection]]
+id = "server-packet"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_server_packet"
+helper = "helpers/server_packet.rs"
+bindings = [
+  { name = "player", ty = "u128", value = "player" },
+  { name = "packet", ty = "&mut horizon_protocol::packets::play::Clientbound", value = "&mut *packet" },
+  { name = "cancel", ty = "&mut bool", value = "&mut *cancel" },
+]
+
+# A respawn: resend what the client may have lost.
+[[injection]]
+id = "respawned"
+hook = "player_respawned"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/respawned.rs"
+bindings = [{ name = "player", ty = "u128", value = "player" }]

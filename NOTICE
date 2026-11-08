@@ -1,0 +1,29 @@
+horizon-tab
+Copyright (c) 2026 Detimes. Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Derived from TAB (https://github.com/NEZNAMY/TAB, Apache-2.0).
+
+This project is a rebuild of TAB (https://github.com/NEZNAMY/TAB) for Horizon. TAB is
+Copyright NEZNAMY and contributors and licensed under the Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0). Its source was read while writing this port;
+no Java code was copied, but the behaviour of these parts follows it closely and they are
+derivative works of TAB under the Apache License 2.0:
+
+- core/src/sorting.rs      (Sorting, SortingType and its types, compressNumber)
+- core/src/properties.rs   (YamlPropertyConfigurationFile.getProperty lookup order)
+- core/src/conditions.rs   (ConditionalExpression operators, order and splitting)
+- core/src/tabph.rs        (TabConstants placeholder names and refresh intervals)
+- core/src/text.rs         (the RGB and gradient formats of RGBUtils)
+- core/src/engine.rs       (the feature behaviour of header/footer, nametags, objectives,
+                            scoreboard, boss bars)
+- core/src/commands.rs     (sub-commands, arguments, permission nodes and messages, ported 1:1 from command/*.java)
+- core/defaults/*.yml      (TAB's default config.yml, animations.yml, messages.yml,
+                            groups.yml and users.yml, unchanged)
+
+Changes: everything is rewritten in Rust for Horizon's engine; numbers in sort keys use a
+smaller base (see core/src/sorting.rs); features listed as not ported in STATUS.md are absent.
+
+The placeholder registry (core/src/placeholders/) is NOT derived from PlaceholderAPI, which is
+GPL-3.0: its source was never opened. It follows only the placeholder syntax users know.
+
+This project is not affiliated with TAB, NEZNAMY, PlaceholderAPI or HelpChat.

@@ -1,14 +1,18 @@
 # horizon-tab
 
-> **Unofficial Rust port of TAB for the Horizon server (https://github.com/horizon-rust/horizon). Not affiliated with or endorsed by the TAB authors.**
-
-TAB's features for [Horizon](https://github.com/horizon-rust/horizon) servers, as a native mod (a horizon-mixins
-bundle): the Tab list's header and footer, formatted player names in the Tab list, name tags and sorting through
-teams, the player list and below-name objectives, the sidebar scoreboard and boss bars, all driven by placeholders.
-It comes with a small placeholder registry that other mods register into, in the role PlaceholderAPI plays on
-Bukkit servers.
+> **Unofficial Rust port of TAB for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the TAB authors.**
 
 **Not affiliated with TAB (NEZNAMY) or PlaceholderAPI (HelpChat).**
+
+> **Built for and working only with [arismoko/horizon](https://github.com/arismoko/horizon)** (the Horizon fork that carries the mod API). [horizon-rust/horizon](https://github.com/horizon-rust/horizon) is experimental for mods and not supported: the earlier version for its native hooks / horizon-mixins is frozen on the `horizon-plain` branch (work stopped on 2026-11-12).
+
+## Which Horizon
+
+This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `horizon-mod-api`, `src/lib.rs` with the hooks, and the plugin logic in the `core/` crate (plain Rust, no engine needed for its tests).
+
+- Pin: `[native] horizon = "54090ee36c4e2c7b43b66db864220c577b94b7e0"` in `horizon-mod.toml` (game `26.3`). That is a development build of arismoko/horizon `main` plus mod API additions that are not all merged upstream yet, so a stock `main` may lack some host methods this mod calls until they land.
+- It compiled and loaded on that build and was smoke-tested there; it has not seen a long run with real players. Treat it as experimental.
+- Feature descriptions below were written for the earlier horizon-rust version; where they name engine calls (`native_*`) or old file paths, read them as descriptions only. The Known gaps list is current.
 
 ## What it does
 
@@ -29,10 +33,10 @@ Bukkit servers.
   `<gradient:#RRGGBB>text</gradient:#RRGGBB>`) and, with `components.minimessage-support`, common MiniMessage tags.
 - Commands, as TAB 6.2.2 has them: `/tab reload | parse | player | playeruuid | group | groups | debug | dump | cpu |
   mysql | scoreboard | bossbar | nametag | setcollision` and the scoreboard toggle command (`/sb`), with TAB's
-  permission nodes (`tab.admin` allows all). `cpu`, `dump` and `mysql` need parts that are not ported, see STATUS.md.
+  permission nodes (`tab.admin` allows all). `cpu`, `dump` and `mysql` need parts that are not ported, see the Known gaps section.
 
-What is ported and what is not: [STATUS.md](STATUS.md). What Horizon would need to do it without internals:
-[GAPS.md](GAPS.md).
+What is ported and what is not: the Known gaps section. What Horizon would need to do it without internals:
+the Known gaps section.
 
 ## For other mods
 
@@ -61,32 +65,23 @@ Without an integration, operators (level 1 and up) have every TAB permission and
 
 ## Build
 
-The bundle is this folder (`horizon-mixin.toml`, `helpers/`, the crate `core/`), pinned to Horizon
-`a589a3dd9be04fa7f17667c0175711aaa92e1147`:
+Build it as a native trait mod with arismoko's launcher (see the "native mods" how-to in the arismoko/horizon docs):
 
 ```sh
-horizon-mixins apply --workspace <horizon source> --mods <folder holding this one> --out <stage>
-cd <stage> && cargo build --profile fast -p horizon-client --no-default-features
-cd core && cargo test          # the logic alone, no engine needed
+horizon-launcher native-build <path to this folder> --server-output <dir> --version <tag> --trust-native-code
 ```
 
-The core uses only `serde_json` and `chrono` from Horizon's `Cargo.lock`.
+`--trust-native-code` is your consent to compile and run this code inside the server. The logic crate tests run without the engine: `(cd core && cargo test)`.
 
-## How it hooks in
+## Known gaps
 
-| Injection | Target | Why |
-|---|---|---|
-| `start` | hook point `server_about_to_start` v1 | default files, load |
-| `tick` | hook point `tick` v1 | players and server to the core, its packets out |
-| `stopping` | hook point `server_stopping` v1 | take away what was shown |
-| `register-commands`, `perform-command`, `console-command` | hook points v1 | `/tab`, `/sb` |
-| `player-info` (RETURN) | `lan::hub::Hub::player_info` | the game's own Tab list entries carry the formatted name |
-| `set-nickname` (HEAD) | `lan::hub::Hub::set_nickname` | a nickname change overwrites names; resend |
-| modules `tab`, `placeholders` | `horizon_client::tab`, `horizon_client::placeholders` | the API, for the game and other mods |
-| module `glue` | `crate::game::tab_glue` | reads hub state (latency, nicknames, hidden players), sends packets |
+What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
-The header and footer go through the game's `native_tab_list`; everything else is sent as vanilla packets
-(`SetPlayerTeam`, `PlayerInfoUpdate`, `SetObjective`, `SetDisplayObjective`, `SetScore`, `ResetScore`, `BossEvent`).
+- Team prefixes and suffixes are not shown (only the colour); the tab-list and below-name objective slots are dropped.
+- The anti-override guard is off (outgoing packets cannot be watched), so other senders' team, latency or name packets are not put back.
+- `%player-version%` is wrong (no protocol read); name completion falls back to plain words.
+- A toggle named like a vanilla command (`/bossbar`) is only reachable as `/tab bossbar`.
+- List names are per player, not per viewer.
 
 ## Licence and origin
 
@@ -99,11 +94,3 @@ Derived from TAB (https://github.com/NEZNAMY/TAB, Apache-2.0). Licensed under th
 - **PlaceholderAPI** is GPL-3.0: **clean room**. Its source and its expansions' sources were never opened. The
   registry (`core/src/placeholders/`) follows only the placeholder syntax users write (`%identifier_params%`,
   `{...}`, `%rel_...%`) and expansion names users know (`player`, `server`).
-
-## Untested
-
-Everything that touches the engine: written against the Horizon source without a build (see STATUS.md, "Test first").
-
-## Contributing
-
-Pull requests and improvements are always welcome! Open an issue or a PR -- direct pushes to main are disabled, every change goes through review.

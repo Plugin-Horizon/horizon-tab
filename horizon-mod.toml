@@ -2,7 +2,7 @@ id = "tab"
 name = "TAB"
 version = "0.1.0"
 description = "Tab list header and footer, name tags, sorting, boss bars and the /tab commands (port of TAB, without teams and objectives)."
-authors = ["CoreSMP"]
+authors = ["Plugin-Horizon contributors"]
 api = "0.2"
 capabilities = ["registries"]
 

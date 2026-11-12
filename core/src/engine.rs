@@ -1805,6 +1805,31 @@ mod tests {
     }
 
     #[test]
+    fn winter_teams_disabled_end_to_end() {
+        // The winter lobby's config differs from the other lobby's only here: scoreboard-teams.enabled false.
+        let config = include_str!("../testdata/config.yml").replacen(
+            "scoreboard-teams:\n  enabled: true",
+            "scoreboard-teams:\n  enabled: false",
+            1,
+        );
+        assert!(config.contains("scoreboard-teams:\n  enabled: false"));
+        let mut e = engine(&config, "Steve:\n  tabprefix: '&c[OP] '\n  tagprefix: '&4[Core] '\n");
+        let packets = e.tick(1000, server(), vec![player("Steve", 1), player("Alex", 2)]);
+        // No team packet of any kind reaches any viewer.
+        for p in &packets {
+            assert!(
+                !matches!(p.out, Out::TeamCreate { .. } | Out::TeamUpdate { .. } | Out::TeamRemove { .. }),
+                "{p:?}"
+            );
+        }
+        // The packet guard does not act on teams either: a foreign team is let through.
+        assert!(!e.guard_team(2, "datapack_team", &["Steve".to_owned()]));
+        // A later tick (a third player joins) still sends no team.
+        let later = e.tick(2000, server(), vec![player("Steve", 1), player("Alex", 2), player("Sam", 3)]);
+        assert!(!later.iter().any(|p| matches!(p.out, Out::TeamCreate { .. } | Out::TeamUpdate { .. })));
+    }
+
+    #[test]
     fn spectator_fix_and_ping_spoof_guards() {
         let mut e = engine(
             "prevent-spectator-effect:\n  enabled: true\nping-spoof:\n  enabled: true\n  value: 0\n",

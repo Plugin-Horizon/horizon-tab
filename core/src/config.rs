@@ -131,7 +131,99 @@ pub struct Config {
     pub minimessage: bool,
     pub debug: bool,
     pub unsupported: Vec<String>,
+    /// Proxy-only keys that are switched on (`proxy-support.enabled`, `use-*`): read and ignored on a
+    /// backend, so no warning, only a note at start.
+    pub proxy_only_on: Vec<String>,
 }
+
+/// Keys of TAB's file that only a proxy reads. The port reads them and does nothing with them.
+pub const PROXY_ONLY_KEYS: &[&str] = &[
+    "proxy-support.enabled",
+    "use-bukkit-permissions-manager",
+    "use-online-uuid-in-tablist",
+];
+
+/// Key paths (`*` = any key) of the files TAB keeps that the port reads. `check_original` compares the
+/// original files against this list. Keep it in step with `Config::from_yaml`, `properties.rs` and `tabph.rs`.
+pub const KEYS_READ: &[&str] = &[
+    "header-footer.enabled",
+    "header-footer.designs.*.display-condition",
+    "header-footer.designs.*.header",
+    "header-footer.designs.*.footer",
+    "tablist-name-formatting.enabled",
+    "tablist-name-formatting.disable-condition",
+    "scoreboard-teams.enabled",
+    "scoreboard-teams.enable-collision",
+    "scoreboard-teams.invisible-nametags",
+    "scoreboard-teams.sorting-types",
+    "scoreboard-teams.case-sensitive-sorting",
+    "scoreboard-teams.can-see-friendly-invisibles",
+    "scoreboard-teams.disable-condition",
+    "playerlist-objective.enabled",
+    "playerlist-objective.value",
+    "playerlist-objective.fancy-value",
+    "playerlist-objective.title",
+    "playerlist-objective.render-type",
+    "playerlist-objective.disable-condition",
+    "belowname-objective.enabled",
+    "belowname-objective.value",
+    "belowname-objective.fancy-value",
+    "belowname-objective.fancy-value-default",
+    "belowname-objective.title",
+    "belowname-objective.disable-condition",
+    "prevent-spectator-effect.enabled",
+    "bossbar.enabled",
+    "bossbar.toggle-command",
+    "bossbar.remember-toggle-choice",
+    "bossbar.hidden-by-default",
+    "bossbar.bars.*.style",
+    "bossbar.bars.*.color",
+    "bossbar.bars.*.progress",
+    "bossbar.bars.*.text",
+    "bossbar.bars.*.display-condition",
+    "bossbar.bars.*.announcement-bar",
+    "scoreboard.enabled",
+    "scoreboard.toggle-command",
+    "scoreboard.remember-toggle-choice",
+    "scoreboard.hidden-by-default",
+    "scoreboard.delay-on-join-milliseconds",
+    "scoreboard.scoreboards.*.title",
+    "scoreboard.scoreboards.*.display-condition",
+    "scoreboard.scoreboards.*.lines",
+    "ping-spoof.enabled",
+    "ping-spoof.value",
+    "placeholders.date-format",
+    "placeholders.time-format",
+    "placeholders.time-offset",
+    "placeholders.register-tab-expansion",
+    "placeholder-output-replacements.*",
+    "conditions.*.type",
+    "conditions.*.conditions",
+    "conditions.*.true",
+    "conditions.*.yes",
+    "conditions.*.false",
+    "conditions.*.no",
+    "placeholder-refresh-intervals.*",
+    "assign-groups-by-permissions",
+    "primary-group-finding-list",
+    "permission-refresh-interval",
+    "debug",
+    "components.minimessage-support",
+    "layout.enabled",
+    "global-playerlist.enabled",
+    "per-world-playerlist.enabled",
+    "mysql.enabled",
+    "proxy-support.enabled",
+    "use-bukkit-permissions-manager",
+    "use-online-uuid-in-tablist",
+    // groups.yml and users.yml (properties.rs, VALID_PROPERTIES)
+    "*.tabprefix",
+    "*.customtabname",
+    "*.tabsuffix",
+    "*.tagprefix",
+    "*.tagsuffix",
+    "per-world.*.*",
+];
 
 impl Default for Config {
     fn default() -> Self {
@@ -311,7 +403,18 @@ impl Config {
             minimessage: y.at(&["components", "minimessage-support"]).bool_or(true),
             debug: y.get("debug").bool_or(false),
             unsupported: Vec::new(),
+            proxy_only_on: Vec::new(),
         };
+        for key in PROXY_ONLY_KEYS {
+            let path: Vec<&str> = key.split('.').collect();
+            let on = match y.at(&path) {
+                Yaml::Bool(b) => *b,
+                _ => false,
+            };
+            if on {
+                cfg.proxy_only_on.push((*key).to_owned());
+            }
+        }
         for (key, what) in [
             ("layout", "layout"),
             ("global-playerlist", "global-playerlist"),
@@ -371,5 +474,19 @@ mod tests {
         );
         assert!(c.unsupported.is_empty());
         assert!(c.minimessage);
+    }
+
+    #[test]
+    fn proxy_only_keys_are_read_and_ignored() {
+        let y = crate::yaml::parse("proxy-support:\n  enabled: true\nuse-online-uuid-in-tablist: false\nuse-bukkit-permissions-manager: true\n")
+            .unwrap();
+        let c = Config::from_yaml(&y);
+        assert_eq!(c.proxy_only_on, vec!["proxy-support.enabled", "use-bukkit-permissions-manager"]);
+        // Inert on a backend: no "not implemented" warning.
+        assert!(c.unsupported.is_empty());
+        // The shipped test config reads the same keys (proxy-support on there).
+        let c = Config::from_yaml(&crate::yaml::parse(include_str!("../testdata/config.yml")).unwrap());
+        assert!(c.proxy_only_on.contains(&"proxy-support.enabled".to_owned()));
+        assert!(c.unsupported.iter().all(|u| u != "proxy-support"));
     }
 }

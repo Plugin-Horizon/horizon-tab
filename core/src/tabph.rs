@@ -84,6 +84,8 @@ fn builtin_interval(token: &str) -> Option<i64> {
         | "%tps%"
         | "%luckperms-prefix%"
         | "%luckperms-suffix%"
+        | "%luckperms_prefix%"
+        | "%luckperms_suffix%"
         | "%luckperms-prefixes%"
         | "%luckperms-suffixes%"
         | "%luckperms-weight%"
@@ -328,8 +330,8 @@ impl TabPlaceholders {
             "%memory-max-gb%" => builtin::two_decimals(ctx.server.memory_max_mb as f64 / 1024.0),
             "%tps%" => builtin::two_decimals(ctx.server.tps.min(20.0)),
             "%mspt%" => builtin::two_decimals(ctx.server.mspt),
-            "%luckperms-prefix%" | "%vault-prefix%" => integration::first(|i| i.prefix(p.uuid)).unwrap_or_default(),
-            "%luckperms-suffix%" | "%vault-suffix%" => integration::first(|i| i.suffix(p.uuid)).unwrap_or_default(),
+            "%luckperms-prefix%" | "%luckperms_prefix%" | "%vault-prefix%" => integration::first(|i| i.prefix(p.uuid)).unwrap_or_default(),
+            "%luckperms-suffix%" | "%luckperms_suffix%" | "%vault-suffix%" => integration::first(|i| i.suffix(p.uuid)).unwrap_or_default(),
             "%luckperms-prefixes%" => integration::first(|i| i.prefixes(p.uuid)).unwrap_or_default(),
             "%luckperms-suffixes%" => integration::first(|i| i.suffixes(p.uuid)).unwrap_or_default(),
             "%luckperms-weight%" => integration::first(|i| i.weight(p.uuid))

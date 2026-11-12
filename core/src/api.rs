@@ -164,41 +164,27 @@ fn tab_values() -> &'static RwLock<HashMap<u128, HashMap<String, String>>> {
     V.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// The folder TAB's files live in: `<config>/tab/` (made, and filled with defaults, when missing).
+/// The folder TAB's files live in: `plugins/TAB/` of the server (the parent of the config folder
+/// the game hands over, so `<server>/config` gives `<server>/plugins/TAB`). Read only: nothing is
+/// written here, so a missing file is read as absent (the built-in defaults are used in memory).
 pub fn files_dir(config_dir: &Path) -> PathBuf {
-    config_dir.join("tab")
+    config_dir.parent().unwrap_or(config_dir).join("plugins").join("TAB")
 }
 
-const DEFAULT_CONFIG: &str = include_str!("../defaults/config.yml");
-const DEFAULT_GROUPS: &str = include_str!("../defaults/groups.yml");
-const DEFAULT_ANIMATIONS: &str = include_str!("../defaults/animations.yml");
-const DEFAULT_MESSAGES: &str = include_str!("../defaults/messages.yml");
-const DEFAULT_USERS: &str = include_str!("../defaults/users.yml");
-
-/// Starts the mod: writes default files where missing, loads them. Log lines to print.
+/// Starts the mod: loads TAB's files from `plugins/TAB/` as they are. Log lines to print.
 pub fn start(config_dir: &Path) -> Vec<String> {
     let dir = files_dir(config_dir);
     let mut log = Vec::new();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        log.push(format!("cannot make {}: {e}", dir.display()));
-    }
-    for (name, text) in [
-        ("config.yml", DEFAULT_CONFIG),
-        ("groups.yml", DEFAULT_GROUPS),
-        ("animations.yml", DEFAULT_ANIMATIONS),
-        ("messages.yml", DEFAULT_MESSAGES),
-        ("users.yml", DEFAULT_USERS),
-        ("playerdata.yml", ""),
-    ] {
-        let path = dir.join(name);
-        if !path.exists() {
-            if let Err(e) = std::fs::write(&path, text) {
-                log.push(format!("cannot write {}: {e}", path.display()));
-            }
-        }
-    }
     let engine = Engine::load(&dir);
     log.extend(engine.warnings.iter().cloned());
+    for name in ["config.yml", "groups.yml", "animations.yml", "messages.yml", "users.yml"] {
+        if !dir.join(name).exists() {
+            log.push(format!("{} missing: built-in defaults in memory, nothing written", dir.join(name).display()));
+        }
+    }
+    for flag in &engine.cfg.proxy_only_on {
+        log.push(format!("{flag} is a proxy option: ignored on this backend"));
+    }
     if engine.cfg.register_tab_expansion {
         register_tab_expansion();
     }
@@ -541,5 +527,37 @@ fn parse_unlocked(uuid: u128, text: &str) -> Option<String> {
 fn register_tab_expansion() {
     if !placeholders::is_registered("tab") {
         placeholders::register(Box::new(TabExpansion));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn files_are_read_from_the_server_plugin_folder() {
+        assert_eq!(files_dir(Path::new("/srv/lobby/config")), PathBuf::from("/srv/lobby/plugins/TAB"));
+    }
+
+    #[test]
+    fn start_writes_nothing_into_the_original_folder() {
+        let root = std::env::temp_dir().join(format!("horizon-tab-start-{}", std::process::id()));
+        let config = root.join("config");
+        let plugin = root.join("plugins").join("TAB");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("config.yml"), "debug: false\n").unwrap();
+        let log = start(&config);
+        // Only the file that exists is there; the missing ones are reported, not written.
+        let mut names: Vec<String> = std::fs::read_dir(&plugin)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["config.yml".to_owned()]);
+        assert!(log.iter().any(|l| l.contains("groups.yml missing")));
+        assert_eq!(std::fs::read_to_string(plugin.join("config.yml")).unwrap(), "debug: false\n");
+        assert!(!config.join("tab").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

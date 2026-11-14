@@ -53,6 +53,42 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The command line the core parses, rebuilt in the order of the usage that matched. The game gives
+/// the literals (in order) and the argument values apart, so the usage says where each value goes:
+/// `tab player <name> remove` has the literal `remove` after the name. With no usage matching, the
+/// literals come first and the values after them (the order this glue used before).
+fn command_line(literals: &[String], values: &[String]) -> String {
+    let fixed: Vec<&str> = literals.iter().map(String::as_str).collect();
+    for (usage, _) in api::commands() {
+        let tokens: Vec<&str> = usage.split_whitespace().collect();
+        let words: Vec<&str> = tokens
+            .iter()
+            .copied()
+            .filter(|t| !t.starts_with('<') && !t.starts_with('['))
+            .collect();
+        let required = tokens.iter().filter(|t| t.starts_with('<')).count();
+        let slots = tokens.len() - words.len();
+        // The literals must be the usage's words in order; the values fill its slots in order, and
+        // only the optional ones (`[...]`, at the end of a usage) may be left out.
+        if words != fixed || values.len() < required || values.len() > slots {
+            continue;
+        }
+        let mut next = values.iter();
+        let mut parts: Vec<&str> = Vec::new();
+        for &token in &tokens {
+            if token.starts_with('<') || token.starts_with('[') {
+                if let Some(value) = next.next() {
+                    parts.push(value.as_str());
+                }
+            } else {
+                parts.push(token);
+            }
+        }
+        return parts.join(" ");
+    }
+    literals.iter().chain(values.iter()).map(String::as_str).collect::<Vec<&str>>().join(" ")
+}
+
 /// A JSON component as the engine reads it (`text_from_json`, as `/tellraw` does). A value that is
 /// not one component reads as empty.
 fn text_json(host: &dyn ServerHost, value: &Value) -> Text {
@@ -473,16 +509,31 @@ impl Hooks for Mod {
         if !ours {
             return Flow::Continue;
         }
-        // Rebuild the line: literal path, then the greedy text argument (`tab [arguments:text]`).
-        let mut line = event.command.literals.join(" ");
+        // Every argument as the core reads it: a player by name (the core looks names up), numbers and
+        // booleans as text. Selectors that are not one player are not used by any usage here.
+        let mut values: Vec<String> = Vec::new();
         for argument in &event.command.arguments {
-            if let CommandArgumentValue::String(text) = &argument.value {
-                line.push(' ');
-                line.push_str(text);
-            }
+            let text = match &argument.value {
+                CommandArgumentValue::String(s) => s.clone(),
+                CommandArgumentValue::Integer(i) => i.to_string(),
+                CommandArgumentValue::Number(n) => n.to_string(),
+                CommandArgumentValue::Boolean(b) => b.to_string(),
+                CommandArgumentValue::Player(p) => p.name(&*host).unwrap_or_default(),
+                _ => continue,
+            };
+            values.push(text);
         }
+        let line = command_line(&event.command.literals, &values);
         let answer = match &event.source {
             CommandSource::Player { player, permission } => {
+                // Ask the game for every command node NOW, so the first command after a join sees the
+                // real answer (the per-tick refresh below arrives one tick late and would refuse
+                // `tab.admin`/`tab.grouplist` holders; parents: `tab.admin` is checked by the core).
+                let now = now_ms();
+                for node in api::command_permission_nodes() {
+                    let answer = host.player(player.uuid()).and_then(|p| p.permission_value(&*host, &node));
+                    api::host_permission_answer(player.uuid(), &node, answer, now);
+                }
                 api::command(Some((player.uuid(), permission.level())), &line)
             }
             CommandSource::Console { .. } => api::command(None, &line),

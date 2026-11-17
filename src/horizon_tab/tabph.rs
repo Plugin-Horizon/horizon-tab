@@ -1,14 +1,14 @@
 //! TAB's own placeholders (`%player%`, `%ping%`, `%online%`, `%animation:Name%`,
 //! `%condition:name%`...), its output replacements and refresh intervals, with every other
-//! `%identifier_params%` handed to the placeholder registry ([`crate::placeholders`]). Names and
+//! `%identifier_params%` handed to the placeholder registry ([`crate::horizon_tab::placeholders`]). Names and
 //! default refresh intervals follow TAB's `TabConstants.Placeholder` (Apache-2.0, NOTICE).
 
-use crate::conditions::Condition;
-use crate::config::Config;
-use crate::integration;
-use crate::placeholders::{self, builtin, Player, Server};
-use crate::text;
-use crate::yaml::Yaml;
+use crate::horizon_tab::conditions::Condition;
+use crate::horizon_tab::config::Config;
+use crate::horizon_tab::integration;
+use crate::horizon_tab::placeholders::{self, builtin, Player, Server};
+use crate::horizon_tab::text;
+use crate::horizon_tab::yaml::Yaml;
 use chrono::{FixedOffset, TimeZone};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -322,8 +322,8 @@ impl TabPlaceholders {
             "%worldonline%" => visible().filter(|o| o.p.world == p.world).count().to_string(),
             "%staffonline%" => visible().filter(|o| staff(*o)).count().to_string(),
             "%nonstaffonline%" => visible().filter(|o| !staff(*o)).count().to_string(),
-            "%time%" => crate::datefmt::format(&self.time_format, &self.now_local()),
-            "%date%" => crate::datefmt::format(&self.date_format, &self.now_local()),
+            "%time%" => crate::horizon_tab::datefmt::format(&self.time_format, &self.now_local()),
+            "%date%" => crate::horizon_tab::datefmt::format(&self.date_format, &self.now_local()),
             "%memory-used%" => ctx.server.memory_used_mb.to_string(),
             "%memory-max%" => ctx.server.memory_max_mb.to_string(),
             "%memory-used-gb%" => builtin::two_decimals(ctx.server.memory_used_mb as f64 / 1024.0),
@@ -394,8 +394,8 @@ mod tests {
     }
 
     fn ph() -> TabPlaceholders {
-        let cfg = Config::from_yaml(&crate::yaml::parse(include_str!("../testdata/config.yml")).unwrap());
-        let anim = load_animations(&crate::yaml::parse(include_str!("../testdata/animations.yml")).unwrap());
+        let cfg = Config::from_yaml(&crate::horizon_tab::yaml::parse(include_str!("../../data/tab/testdata/config.yml")).unwrap());
+        let anim = load_animations(&crate::horizon_tab::yaml::parse(include_str!("../../data/tab/testdata/animations.yml")).unwrap());
         TabPlaceholders::new(&cfg, anim)
     }
 

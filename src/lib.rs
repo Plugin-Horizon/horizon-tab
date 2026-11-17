@@ -7,25 +7,27 @@
 //! (host boss bar calls, one bar per viewer), the tab list name (`player_tab_list_name_format`),
 //! the tick (`server_tick`), respawns and the stop.
 //!
-//! Packets: latency and game mode per viewer go out through `player_send_packet`. Permission
-//! nodes are asked of the game (`player_permission_value`) each tick, for the nodes the core asked
-//! about. Not ported yet: teams (name tags), objectives (tab list ping and health, below name,
-//! sidebar), scores, per-viewer display names (their bodies need NBT text components), the packet
-//! guard, and the LuckPerms bridge (its placeholders and prefixes).
+//! Packets: latency and game mode per viewer were to go out through `player_send_packet`, which
+//! Horizon main lacks (HMOD-GAP). Permission nodes are declared once (`permission_gather_nodes`)
+//! and asked of the game as typed Boolean queries each tick. Not ported: teams (name tags),
+//! objectives (tab list ping and health, below name, sidebar), scores, per-viewer display names,
+//! the packet guard, and the LuckPerms bridge (its placeholders and prefixes).
 
-use horizon_tab::api;
-use horizon_tab::engine::PlayerIn;
-use horizon_tab::out::{BossOut, Out, Packet};
-use horizon_tab::placeholders::Server;
+
+pub mod horizon_tab;
+use crate::horizon_tab::api;
+use crate::horizon_tab::engine::PlayerIn;
+use crate::horizon_tab::out::{BossOut, Out, Packet};
+use crate::horizon_tab::placeholders::Server;
 use mod_api::serde_json::Value;
 use mod_api::{
-    BossBarColor, BossBarOverlay, ClientboundPlayPacket, Command, CommandArgumentValue,
-    CommandSource, Flow, Hooks, Identifier, LoopContext, PlayerRef, PlayerRespawnedEvent,
-    PlayerTabListNameFormatEvent, RegisterCommandsEvent, RunModCommandEvent, ServerAboutToStartEvent,
-    ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
+    BossBarColor, BossBarOverlay, Command, CommandArgumentValue, CommandSource, Flow, Hooks,
+    LoopContext, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
+    PermissionValueType, PlayerRef, PlayerRespawnedEvent, PlayerTabListNameFormatEvent,
+    RegisterCommandsEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
+    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
 };
-use horizon_tab::out::{NumberFmt, ObjectiveMethod};
-use mod_api::{Sidebar, SidebarLine};
+use crate::horizon_tab::out::{NumberFmt, ObjectiveMethod};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -150,10 +152,12 @@ fn player_in(host: &dyn ServerHost, player: PlayerRef) -> PlayerIn {
         health,
         game_mode: player.game_mode(host).map(|mode| mode.id()).unwrap_or(0),
         op_level: player.permission_level(host).unwrap_or(0),
-        ping: player.latency(host).unwrap_or(0),
-        nickname: player.nickname(host).flatten(),
-        // A player hidden by `player_hide` (a level set) is vanished.
-        vanished: player.hidden(host).flatten().is_some(),
+        // HMOD-GAP(player_latency): Horizon main has no read of a player's latency; `%ping%` is 0.
+        ping: 0,
+        // HMOD-GAP(player_nickname_read): Horizon main has a nickname setter only; no nickname is read.
+        nickname: None,
+        // HMOD-GAP(player_hidden_read): `player_hide` is a setter only; nobody is read as vanished.
+        vanished: false,
         entity_id: entity.id() as i32,
         // TODO(arismoko-api: player_client_protocol): no protocol read; `%player-version%` is wrong.
         protocol: 0,
@@ -185,15 +189,22 @@ fn player_info_body(action: u8, entries: &[(u128, i32)]) -> Vec<u8> {
     body
 }
 
-/// Sends one player-info action to `viewer` alone, through `player_send_packet`.
+/// Sends one player-info action to `viewer` alone.
+// HMOD-GAP(player_send_packet): Horizon main has no server-side call that sends a clientbound play
+// packet to one player (only the client's `send_packet`). Latency and game mode per viewer are not
+// sent; the bodies are still built by `player_info_body`.
 fn send_player_info(host: &mut dyn ServerHost, viewer: u128, action: u8, entries: &[(u128, i32)]) {
-    let Some(player) = host.player(viewer) else {
-        return;
+    let _ = (host, viewer, player_info_body(action, entries));
+}
+
+/// The permission answer for a Boolean node, asked of the game as a typed query. Any refusal
+/// (an undeclared node, a player the server does not know) is a denial, never a grant.
+fn host_answer(host: &mut dyn ServerHost, uuid: u128, node: &str) -> Option<bool> {
+    let Some(player) = host.player(uuid) else {
+        return Some(false);
     };
-    let Ok(id) = Identifier::parse("minecraft:player_info_update") else {
-        return;
-    };
-    let _ = host.player_send_packet(player, ClientboundPlayPacket::new(id, player_info_body(action, entries)));
+    let node = PermissionNode::new(node, PermissionValueType::Boolean);
+    Some(player.permission_bool(host, &node).unwrap_or(false))
 }
 
 /// The packets the core answers, sent to the players they name.
@@ -222,12 +233,9 @@ fn send(host: &mut dyn ServerHost, packets: Vec<Packet>) {
             Out::DisplayNames(entries) => display_names(host, entries),
             Out::TeamCreate { name, params, players } => team(host, &name, params.color, Some(players)),
             Out::TeamUpdate { name, params } => team(host, &name, params.color, None),
+            // HMOD-GAP(team_remove): see `team`; there are no scoreboard teams to remove.
             Out::TeamRemove { name } => {
-                let mut st = state();
-                if st.teams.remove(&name).is_some() {
-                    drop(st);
-                    host.team_remove(&name);
-                }
+                let _ = name;
             }
             out @ (Out::Objective { .. } | Out::DisplaySlot { .. } | Out::Score { .. } | Out::ResetScore { .. }) => {
                 if state().views.entry(to).or_default().apply(out) {
@@ -315,37 +323,10 @@ impl View {
 
 /// The viewer's sidebar from their objectives: lines by score, highest first (as vanilla sorts),
 /// the line's text its display (else the owner), the right side its number format (else the score).
+// HMOD-GAP(set_sidebar): Horizon main has no sidebar objective API, so the sidebar is not shown.
+// The objectives and scores are still kept by `View::apply`; nothing is drawn from them.
 fn sidebar(host: &mut dyn ServerHost, viewer: u128) {
-    let built = {
-        let st = state();
-        st.views.get(&viewer).and_then(|v| {
-            let name = v.sidebar.as_ref()?;
-            let title = v.titles.get(name).cloned().unwrap_or(Value::String(String::new()));
-            let mut rows: Vec<_> = v.scores.get(name).map(|m| m.iter().map(|(o, r)| (o.clone(), r.clone())).collect()).unwrap_or_default();
-            rows.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
-            Some((title, rows))
-        })
-    };
-    let Some(player) = host.player(viewer) else { return };
-    let sidebar = built.map(|(title, rows)| {
-        let lines = rows
-            .into_iter()
-            .take(15)
-            .map(|(owner, (score, display, format))| {
-                let text = display.map(|d| text_json(&*host, &d)).unwrap_or_else(|| Text::literal(owner.as_str()));
-                let value = match format {
-                    Some(NumberFmt::Blank) => None,
-                    Some(NumberFmt::Fixed(v)) => Some(text_json(&*host, &v)),
-                    None => Some(Text::literal(score.to_string().as_str())),
-                };
-                SidebarLine::new(text, value)
-            })
-            .collect();
-        Sidebar::new(text_json(&*host, &title), lines)
-    });
-    if let Err(e) = player.set_sidebar(host, sidebar) {
-        log(&format!("sidebar not set: {e:?}"));
-    }
+    let _ = (host, viewer);
 }
 
 /// `TeamColor` index (0..15) to the chat colour name `team_set` takes.
@@ -354,43 +335,19 @@ const COLORS: [&str; 16] = [
     "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white",
 ];
 
-/// A TAB team (name tags and sorting) as a team of the world's scoreboard (`team_set`/`team_join`).
-/// The core sends the same team to every viewer; the engine's teams are shared, so each change is
-/// made once. TODO(arismoko-api: team prefix/suffix/visibility/collision): `team_set` takes the colour
-/// only, so TAB's tag prefix and suffix are not shown (the colour is).
+/// A TAB team (name tags and sorting) as a team of the world's scoreboard.
+// HMOD-GAP(team_set/team_join): Horizon main has no scoreboard teams, so TAB's teams (name tag
+// colours and team sorting) are not set. The core's team packets are dropped here.
 fn team(host: &mut dyn ServerHost, name: &str, color: Option<i32>, players: Option<Vec<String>>) {
-    let mut st = state();
-    if st.teams.get(name) != Some(&color) {
-        let c = color.and_then(|i| usize::try_from(i).ok()).and_then(|i| COLORS.get(i).copied());
-        if host.team_set(name, c) {
-            st.teams.insert(name.to_owned(), color);
-        } else {
-            log(&format!("team {name} not set"));
-            return;
-        }
-    }
-    for player in players.into_iter().flatten() {
-        if st.members.get(&player).map(String::as_str) != Some(name) && host.team_join(name, &player) {
-            st.members.insert(player, name.to_owned());
-        }
-    }
+    let _ = (host, name, color, players, COLORS);
 }
 
 /// TAB's tab list names. The core sends them per viewer; `set_list_name` is the same for everyone,
 /// so a name is set when it differs from the last one set (TODO(arismoko-api: per-viewer list names)).
+// HMOD-GAP(set_list_name): Horizon main has no tab list name setter, so the core's per-viewer
+// names are not sent. The tab list name hook (`player_tab_list_name_format`) still sets names.
 fn display_names(host: &mut dyn ServerHost, entries: Vec<(u128, Option<Value>)>) {
-    for (target, value) in entries {
-        let key = value.as_ref().map(Value::to_string);
-        if state().list_names.get(&target) == Some(&key) {
-            continue;
-        }
-        let text = value.map(|v| text_json(&*host, &v));
-        if let Some(player) = host.player(target) {
-            if matches!(player.set_list_name(host, text), Ok(true)) {
-                state().list_names.insert(target, key);
-            }
-        }
-    }
+    let _ = (host, entries);
 }
 
 fn color_of(index: i32) -> Option<BossBarColor> {
@@ -467,6 +424,20 @@ fn boss(host: &mut dyn ServerHost, viewer: u128, id: u128, action: BossOut) {
 
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        // The `/tab` command nodes and `tab.staff` fell back to operator level 1 when no permissions
+        // mod answered. `tab.spectatorbypass` was asked with a fallback of 0 (nobody); its default
+        // here is operator level 4. Nodes the core builds from config are not declared (see HMOD_PORT.md).
+        let mut names = api::command_permission_nodes();
+        names.push("tab.staff".to_owned());
+        for name in names {
+            let node = PermissionNode::new(name, PermissionValueType::Boolean);
+            let _ = event.nodes.add(node, NodeDefault::Level(PermissionLevel::from_level(1)));
+        }
+        let bypass = PermissionNode::new("tab.spectatorbypass", PermissionValueType::Boolean);
+        let _ = event.nodes.add(bypass, NodeDefault::Level(PermissionLevel::from_level(4)));
+    }
+
     fn server_about_to_start(&self, _: &mut dyn ServerHost, _: &mut ServerAboutToStartEvent) {
         if api::started() {
             return;
@@ -531,7 +502,7 @@ impl Hooks for Mod {
                 // `tab.admin`/`tab.grouplist` holders; parents: `tab.admin` is checked by the core).
                 let now = now_ms();
                 for node in api::command_permission_nodes() {
-                    let answer = host.player(player.uuid()).and_then(|p| p.permission_value(&*host, &node));
+                    let answer = host_answer(host, player.uuid(), &node);
                     api::host_permission_answer(player.uuid(), &node, answer, now);
                 }
                 api::command(Some((player.uuid(), permission.level())), &line)
@@ -579,11 +550,11 @@ impl Hooks for Mod {
         // no permissions mod answers, so the operator level decides).
         let now = now_ms();
         for (uuid, node) in api::host_permission_requests(now) {
-            let answer = host.player(uuid).and_then(|p| p.permission_value(&*host, &node));
+            let answer = host_answer(host, uuid, &node);
             api::host_permission_answer(uuid, &node, answer, now);
         }
         let present: HashSet<u128> = online.iter().map(|p| p.uuid()).collect();
-        horizon_tab::integration::host_permissions_retain(&present);
+        crate::horizon_tab::integration::host_permissions_retain(&present);
         let players: Vec<PlayerIn> = online
             .into_iter()
             .map(|player| player_in(&*host, player))

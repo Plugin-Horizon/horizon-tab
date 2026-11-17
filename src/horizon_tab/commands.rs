@@ -3,10 +3,10 @@
 //! (Apache-2.0, see NOTICE). `cpu` and `dump` print no report/upload, and `mysql` always answers
 //! that MySQL is not enabled: those parts of TAB are not in this port.
 
-use crate::engine::Engine;
-use crate::integration;
-use crate::out::{Out, Packet};
-use crate::properties::VALID_PROPERTIES;
+use crate::horizon_tab::engine::Engine;
+use crate::horizon_tab::integration;
+use crate::horizon_tab::out::{Out, Packet};
+use crate::horizon_tab::properties::VALID_PROPERTIES;
 
 /// The TAB version whose commands this follows (shown by `/tab`).
 const TAB_VERSION: &str = "6.2.2";
@@ -114,7 +114,7 @@ fn tell(e: &Engine, sender: Sender, o: &mut Output, uuid: u128, line: String) {
     for l in line.split('\n') {
         o.packets.push(Packet {
             to: uuid,
-            out: Out::Chat(crate::text::component(l, e.cfg.minimessage)),
+            out: Out::Chat(crate::horizon_tab::text::component(l, e.cfg.minimessage)),
         });
     }
 }
@@ -333,7 +333,7 @@ fn dump(e: &mut Engine, a: &[String], o: &mut Output) {
     }));
     o.say(format!(
         "&6Placeholder expansions: &f{}",
-        crate::placeholders::identifiers().join(", ")
+        crate::horizon_tab::placeholders::identifiers().join(", ")
     ));
     let tp = e.tab_player(i).clone();
     o.say(format!(
@@ -566,8 +566,8 @@ fn property_help(o: &mut Output) {
 }
 
 /// A YAML value the way Java's `toString` writes it (lists as `[a, b]`).
-fn java_string(v: &crate::yaml::Yaml) -> String {
-    use crate::yaml::Yaml;
+fn java_string(v: &crate::horizon_tab::yaml::Yaml) -> String {
+    use crate::horizon_tab::yaml::Yaml;
     match v {
         Yaml::List(items) => format!("[{}]", items.iter().map(java_string).collect::<Vec<_>>().join(", ")),
         Yaml::Map(entries) => format!(
@@ -593,7 +593,7 @@ fn group_info(e: &Engine, group: &str, o: &mut Output) {
     for (section, header) in [("per-world", "&6World {}:&e"), ("per-server", "&3Server {}:&b")] {
         for (name, groups) in file.get(section).entries() {
             let settings = groups.get(group);
-            if !matches!(settings, crate::yaml::Yaml::Map(_)) {
+            if !matches!(settings, crate::horizon_tab::yaml::Yaml::Map(_)) {
                 continue;
             }
             o.say(header.replace("{}", name));
@@ -1006,19 +1006,19 @@ fn nametag(e: &mut Engine, sender: Sender, a: &[String], o: &mut Output) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::engine::PlayerIn;
-    use crate::placeholders::Server;
-    use crate::properties::{Properties, PropertyFile};
-    use crate::yaml::{self, Yaml};
+    use crate::horizon_tab::config::Config;
+    use crate::horizon_tab::engine::PlayerIn;
+    use crate::horizon_tab::placeholders::Server;
+    use crate::horizon_tab::properties::{Properties, PropertyFile};
+    use crate::horizon_tab::yaml::{self, Yaml};
 
     fn engine() -> Engine {
-        let cfg = Config::from_yaml(&yaml::parse(include_str!("../testdata/config.yml")).unwrap());
+        let cfg = Config::from_yaml(&yaml::parse(include_str!("../../data/tab/testdata/config.yml")).unwrap());
         let props = Properties {
-            groups: PropertyFile::from_str(include_str!("../testdata/groups.yml"), "group").unwrap(),
+            groups: PropertyFile::from_str(include_str!("../../data/tab/testdata/groups.yml"), "group").unwrap(),
             users: PropertyFile::from_str("", "user").unwrap(),
         };
-        let messages = yaml::parse(include_str!("../defaults/messages.yml")).unwrap();
+        let messages = yaml::parse(include_str!("../../data/tab/defaults/messages.yml")).unwrap();
         let mut e = Engine::new(
             "/nonexistent".into(),
             cfg,

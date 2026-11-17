@@ -2,7 +2,7 @@
 //! Only the keys this mod acts on are modelled; [`Config::unsupported`] lists switched-on features
 //! it does not implement, for a warning at start.
 
-use crate::yaml::Yaml;
+use crate::horizon_tab::yaml::Yaml;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn reads_our_shape() {
-        let y = crate::yaml::parse(include_str!("../testdata/config.yml")).unwrap();
+        let y = crate::horizon_tab::yaml::parse(include_str!("../../data/tab/testdata/config.yml")).unwrap();
         let c = Config::from_yaml(&y);
         assert!(!c.header_footer.enabled);
         assert_eq!(c.header_footer.designs.len(), 2);
@@ -478,14 +478,14 @@ mod tests {
 
     #[test]
     fn proxy_only_keys_are_read_and_ignored() {
-        let y = crate::yaml::parse("proxy-support:\n  enabled: true\nuse-online-uuid-in-tablist: false\nuse-bukkit-permissions-manager: true\n")
+        let y = crate::horizon_tab::yaml::parse("proxy-support:\n  enabled: true\nuse-online-uuid-in-tablist: false\nuse-bukkit-permissions-manager: true\n")
             .unwrap();
         let c = Config::from_yaml(&y);
         assert_eq!(c.proxy_only_on, vec!["proxy-support.enabled", "use-bukkit-permissions-manager"]);
         // Inert on a backend: no "not implemented" warning.
         assert!(c.unsupported.is_empty());
         // The shipped test config reads the same keys (proxy-support on there).
-        let c = Config::from_yaml(&crate::yaml::parse(include_str!("../testdata/config.yml")).unwrap());
+        let c = Config::from_yaml(&crate::horizon_tab::yaml::parse(include_str!("../../data/tab/testdata/config.yml")).unwrap());
         assert!(c.proxy_only_on.contains(&"proxy-support.enabled".to_owned()));
         assert!(c.unsupported.iter().all(|u| u != "proxy-support"));
     }

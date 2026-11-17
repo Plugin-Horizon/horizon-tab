@@ -5,17 +5,17 @@
 //! prefixes, vanish, Bedrock), [`parse`] (TAB placeholders for an online player) and the TAB
 //! expansion's values (`%tab_tabprefix%`... when `placeholders.register-tab-expansion` is on).
 
-use crate::commands::{self, Output, Seg, Sender};
-use crate::engine::{Engine, PlayerIn};
-use crate::out::Packet;
-use crate::placeholders::{self, Player, Server};
-use crate::properties::VALID_PROPERTIES;
+use crate::horizon_tab::commands::{self, Output, Seg, Sender};
+use crate::horizon_tab::engine::{Engine, PlayerIn};
+use crate::horizon_tab::out::Packet;
+use crate::horizon_tab::placeholders::{self, Player, Server};
+use crate::horizon_tab::properties::VALID_PROPERTIES;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, RwLock};
 
-pub use crate::integration::{
+pub use crate::horizon_tab::integration::{
     host_permission_answer, host_permission_requests, register as register_integration,
     unregister as unregister_integration, Integration,
 };
@@ -204,7 +204,7 @@ pub fn tick(now_ms: i64, server: Server, players: Vec<PlayerIn>) -> Vec<Packet> 
     let mut packets = std::mem::take(&mut s.pending);
     packets.extend(s.engine.tick(now_ms, server, players));
     *list_names().write().unwrap_or_else(|e| e.into_inner()) = s.engine.list_names();
-    crate::integration::host_permissions_retain(&s.engine.all_players().iter().map(|p| p.p.uuid).collect());
+    crate::horizon_tab::integration::host_permissions_retain(&s.engine.all_players().iter().map(|p| p.p.uuid).collect());
     if s.engine.cfg.register_tab_expansion {
         let mut values = HashMap::new();
         for p in s.engine.all_players() {
@@ -293,7 +293,7 @@ pub fn commands() -> Vec<(String, u8)> {
     for (root, kind) in [("player", "player_name"), ("playeruuid", "player_name"), ("group", "word")] {
         u.push(format!("tab {root} <name:{kind}>"));
         u.push(format!("tab {root} <name:{kind}> remove"));
-        for p in crate::commands::COMMAND_PROPERTIES {
+        for p in crate::horizon_tab::commands::COMMAND_PROPERTIES {
             u.push(format!("tab {root} <name:{kind}> {p} [value:text]"));
         }
     }
@@ -393,7 +393,7 @@ fn answer(o: Output, minimessage: bool, pending: &mut Vec<Packet>) -> Answer {
                 let parts: Vec<Value> = segs
                     .iter()
                     .map(|seg| match seg {
-                        Seg::Fmt(t) => crate::text::component(t, minimessage),
+                        Seg::Fmt(t) => crate::horizon_tab::text::component(t, minimessage),
                         Seg::Lit(t, color) => serde_json::json!({ "text": t, "color": color }),
                     })
                     .collect();
@@ -401,15 +401,15 @@ fn answer(o: Output, minimessage: bool, pending: &mut Vec<Packet>) -> Answer {
                 plain.push(
                     segs.iter()
                         .map(|seg| match seg {
-                            Seg::Fmt(t) => crate::text::plain(t, minimessage),
+                            Seg::Fmt(t) => crate::horizon_tab::text::plain(t, minimessage),
                             Seg::Lit(t, _) => t.clone(),
                         })
                         .collect(),
                 );
             }
             None => {
-                lines.push(crate::text::component(line, minimessage));
-                plain.push(crate::text::plain(line, minimessage));
+                lines.push(crate::horizon_tab::text::component(line, minimessage));
+                plain.push(crate::horizon_tab::text::plain(line, minimessage));
             }
         }
     }

@@ -4,8 +4,8 @@
 //! result, the key paths the port reads (`config::KEYS_READ`), and the key paths it does not read.
 //! Values are never printed. Keys of `users.yml` (player names and UUIDs) are printed as `<user>`.
 
-use horizon_tab::config::KEYS_READ;
-use horizon_tab::yaml::{self, Yaml};
+use mod_tab::horizon_tab::config::KEYS_READ;
+use mod_tab::horizon_tab::yaml::{self, Yaml};
 use std::path::Path;
 
 /// `*` in a pattern matches one key; a pattern matches a path that starts with it.

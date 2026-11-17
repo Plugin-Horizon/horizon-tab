@@ -8,15 +8,15 @@
 //! objective, the sidebar scoreboard, boss bars, spectator fix and ping spoof. How each one
 //! behaves follows TAB's feature classes (Apache-2.0, see NOTICE).
 
-use crate::config::{Board, Config};
-use crate::integration;
-use crate::out::{BossOut, NumberFmt, ObjectiveMethod, Out, Packet, TeamParams};
-use crate::placeholders::{self, uuid_string, Player, Server};
-use crate::properties::{Properties, PropertyFile};
-use crate::sorting::{self, SortingType};
-use crate::tabph::{self, Ctx, TabPlaceholders, TabPlayer};
-use crate::text;
-use crate::yaml::{self, Yaml};
+use crate::horizon_tab::config::{Board, Config};
+use crate::horizon_tab::integration;
+use crate::horizon_tab::out::{BossOut, NumberFmt, ObjectiveMethod, Out, Packet, TeamParams};
+use crate::horizon_tab::placeholders::{self, uuid_string, Player, Server};
+use crate::horizon_tab::properties::{Properties, PropertyFile};
+use crate::horizon_tab::sorting::{self, SortingType};
+use crate::horizon_tab::tabph::{self, Ctx, TabPlaceholders, TabPlayer};
+use crate::horizon_tab::text;
+use crate::horizon_tab::yaml::{self, Yaml};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1502,15 +1502,15 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::properties::PropertyFile;
+    use crate::horizon_tab::properties::PropertyFile;
 
     fn engine(config: &str, users: &str) -> Engine {
         let cfg = Config::from_yaml(&yaml::parse(config).unwrap());
         let props = Properties {
-            groups: PropertyFile::from_str(include_str!("../testdata/groups.yml"), "group").unwrap(),
+            groups: PropertyFile::from_str(include_str!("../../data/tab/testdata/groups.yml"), "group").unwrap(),
             users: PropertyFile::from_str(users, "user").unwrap(),
         };
-        let anim = tabph::load_animations(&yaml::parse(include_str!("../testdata/animations.yml")).unwrap());
+        let anim = tabph::load_animations(&yaml::parse(include_str!("../../data/tab/testdata/animations.yml")).unwrap());
         Engine::new(
             PathBuf::from("/nonexistent"),
             cfg,
@@ -1548,7 +1548,7 @@ mod tests {
     #[test]
     fn our_config_two_players() {
         let mut e = engine(
-            include_str!("../testdata/config.yml"),
+            include_str!("../../data/tab/testdata/config.yml"),
             "Steve:\n  tabprefix: '&c&l[OP] &f'\n  tagprefix: '&4&l[Core] &f&l'\n",
         );
         let packets = e.tick(1000, server(), vec![player("Steve", 1), player("Alex", 2)]);
@@ -1629,7 +1629,7 @@ mod tests {
 
     #[test]
     fn disable_condition_by_world() {
-        let mut e = engine(include_str!("../testdata/config.yml"), "");
+        let mut e = engine(include_str!("../../data/tab/testdata/config.yml"), "");
         let mut p = player("Steve", 1);
         p.dimension = "minecraft:the_nether".into();
         let packets = e.tick(
@@ -1642,7 +1642,7 @@ mod tests {
         );
         assert!(packets.iter().any(|p| matches!(&p.out, Out::TeamCreate { .. })));
         // A world named like the disable condition: no formatting.
-        let mut e = engine(include_str!("../testdata/config.yml"), "");
+        let mut e = engine(include_str!("../../data/tab/testdata/config.yml"), "");
         let packets = e.tick(
             0,
             Server {
@@ -1733,7 +1733,7 @@ mod tests {
 
     #[test]
     fn nametag_view_hidden() {
-        let mut e = engine(include_str!("../testdata/config.yml"), "");
+        let mut e = engine(include_str!("../../data/tab/testdata/config.yml"), "");
         e.tick(0, server(), vec![player("Steve", 1), player("Alex", 2)]);
         let i = e.index_of(1).unwrap();
         assert!(e.set_nametag_view_hidden(i, None));
@@ -1745,7 +1745,7 @@ mod tests {
 
     #[test]
     fn unload_takes_everything_away() {
-        let mut e = engine(include_str!("../testdata/config.yml"), "");
+        let mut e = engine(include_str!("../../data/tab/testdata/config.yml"), "");
         e.tick(0, server(), vec![player("Steve", 1)]);
         let out = e.unload();
         assert!(out.iter().any(|p| matches!(&p.out, Out::TeamRemove { .. })));
@@ -1774,7 +1774,7 @@ mod tests {
     #[test]
     fn guards_keep_our_values_against_other_senders() {
         let mut e = engine(
-            include_str!("../testdata/config.yml"),
+            include_str!("../../data/tab/testdata/config.yml"),
             "Steve:\n  tabprefix: '&c&l[OP] &f'\n  tagprefix: '&4&l[Core] &f&l'\n",
         );
         let packets = e.tick(1000, server(), vec![player("Steve", 1), player("Alex", 2)]);
@@ -1807,7 +1807,7 @@ mod tests {
     #[test]
     fn winter_teams_disabled_end_to_end() {
         // The winter lobby's config differs from the other lobby's only here: scoreboard-teams.enabled false.
-        let config = include_str!("../testdata/config.yml").replacen(
+        let config = include_str!("../../data/tab/testdata/config.yml").replacen(
             "scoreboard-teams:\n  enabled: true",
             "scoreboard-teams:\n  enabled: false",
             1,

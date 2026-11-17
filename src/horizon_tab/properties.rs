@@ -5,7 +5,7 @@
 //! `_DEFAULT_`; users by name, then by UUID, then the player's group in `groups.yml`.
 //! Sections and keys are matched without case. `/tab player|group` edits write the same files.
 
-use crate::yaml::{self, Yaml};
+use crate::horizon_tab::yaml::{self, Yaml};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_GROUP: &str = "_DEFAULT_";
@@ -251,7 +251,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let original = "admin:\n  tabprefix: 'unterminated\nother:\n  tabprefix: 'x'\n";
         std::fs::write(dir.join("groups.yml"), original).unwrap();
-        let mut e = crate::engine::Engine::load(&dir);
+        let mut e = crate::horizon_tab::engine::Engine::load(&dir);
         assert!(e.props.groups.broken.is_some());
         e.props.groups.set("admin", "tabprefix", Some("&c"), None, None);
         assert!(e.props.groups.save().is_err());
@@ -261,7 +261,7 @@ mod tests {
 
     fn props() -> Properties {
         Properties {
-            groups: PropertyFile::from_str(include_str!("../testdata/groups.yml"), "group").unwrap(),
+            groups: PropertyFile::from_str(include_str!("../../data/tab/testdata/groups.yml"), "group").unwrap(),
             users: PropertyFile::from_str(
                 "Steve:\n  tabprefix: '&c&l[OP] &f'\n01234567-89ab-cdef-0123-456789abcdef:\n  tabsuffix: ' &bVerified'\nper-world:\n  nether:\n    Steve:\n      tabprefix: '&cHot '\n",
                 "user",
@@ -305,7 +305,7 @@ mod tests {
         p.users.set("Alex", "tagprefix", Some("&a"), None, None);
         p.users.set("Steve", "tabprefix", None, None, None);
         assert!(p.users.get("Steve", "tabprefix", None, None).is_none());
-        let text = crate::yaml::write(&p.users.root);
+        let text = crate::horizon_tab::yaml::write(&p.users.root);
         let back = PropertyFile::from_str(&text, "user").unwrap();
         assert_eq!(back.get("Alex", "tagprefix", None, None).unwrap().value, "&a");
         p.users.remove_all("Steve");

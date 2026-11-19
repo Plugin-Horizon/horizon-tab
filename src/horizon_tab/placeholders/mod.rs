@@ -46,6 +46,10 @@ pub struct Player {
     /// Operator level 0..4.
     pub op_level: u8,
     pub vanished: bool,
+    /// Invisible (the invisibility effect or flag), as `%invisible%` shows it.
+    pub invisible: bool,
+    /// Deaths counted by the statistics.
+    pub deaths: i32,
     pub entity_id: i32,
     /// Milliseconds since the epoch when they joined this server.
     pub joined_at_ms: i64,

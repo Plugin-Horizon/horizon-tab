@@ -25,7 +25,7 @@ use mod_api::{
     LoopContext, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
     PermissionValueType, PlayerRef, PlayerRespawnedEvent, PlayerTabListNameFormatEvent,
     RegisterCommandsEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
-    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
+    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StatType, Text,
 };
 use crate::horizon_tab::out::{NumberFmt, ObjectiveMethod};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -158,6 +158,10 @@ fn player_in(host: &dyn ServerHost, player: PlayerRef) -> PlayerIn {
         nickname: None,
         // HMOD-GAP(player_hidden_read): `player_hide` is a setter only; nobody is read as vanished.
         vanished: false,
+        invisible: entity.is_invisible(host).unwrap_or(false),
+        deaths: player
+            .stat(host, StatType::Custom, "minecraft:deaths")
+            .unwrap_or(0),
         entity_id: entity.id() as i32,
         // TODO(arismoko-api: player_client_protocol): no protocol read; `%player-version%` is wrong.
         protocol: 0,
@@ -425,17 +429,19 @@ fn boss(host: &mut dyn ServerHost, viewer: u128, id: u128, action: BossOut) {
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
     fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
-        // The `/tab` command nodes and `tab.staff` fell back to operator level 1 when no permissions
-        // mod answered. `tab.spectatorbypass` was asked with a fallback of 0 (nobody); its default
-        // here is operator level 4. Nodes the core builds from config are not declared (see HMOD_PORT.md).
+        // The original plugin.yml declares every `tab.*` node with `default: op`, so each one gets operator
+        // level 1 here, `tab.spectatorbypass` included. The `tab.group.<name>` nodes come from the config.
         let mut names = api::command_permission_nodes();
         names.push("tab.staff".to_owned());
+        names.push("tab.bypass".to_owned());
+        names.push("tab.seevanished".to_owned());
+        names.extend(api::group_permission_nodes(Path::new("config")));
         for name in names {
             let node = PermissionNode::new(name, PermissionValueType::Boolean);
             let _ = event.nodes.add(node, NodeDefault::Level(PermissionLevel::from_level(1)));
         }
         let bypass = PermissionNode::new("tab.spectatorbypass", PermissionValueType::Boolean);
-        let _ = event.nodes.add(bypass, NodeDefault::Level(PermissionLevel::from_level(4)));
+        let _ = event.nodes.add(bypass, NodeDefault::Level(PermissionLevel::from_level(1)));
     }
 
     fn server_about_to_start(&self, _: &mut dyn ServerHost, _: &mut ServerAboutToStartEvent) {
@@ -446,8 +452,8 @@ impl Hooks for Mod {
         for line in api::start(Path::new("config")) {
             log(&line);
         }
-        log("ported to arismoko: tab list, chat, boss bars, commands, name format, latency, game mode,");
-        log("teams (colour only), list names and the sidebar; tag prefix/suffix, below-name and list objectives are not");
+        log("ported: tab list header/footer, one list name per player, boss bars, chat, commands and placeholders.");
+        log("Not shown yet: scoreboard teams (name tags, sorting), sidebar, below-name and list objectives, ping and game mode.");
     }
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {

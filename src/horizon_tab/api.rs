@@ -44,6 +44,7 @@ pub fn command_permission_nodes() -> Vec<String> {
         "tab.parse",
         "tab.reload",
         "tab.remove",
+        "tab.send.bar",
         "tab.scoreboard.show",
         "tab.scoreboard.show.other",
         "tab.scoreboard.toggle",
@@ -55,6 +56,26 @@ pub fn command_permission_nodes() -> Vec<String> {
     .collect();
     nodes.extend(VALID_PROPERTIES.iter().map(|p| format!("tab.change.{p}")));
     nodes
+}
+
+/// The `tab.group.<name>` nodes the config can ask about (`assign-groups-by-permissions`): the names in
+/// `primary-group-finding-list` and the groups of `groups.yml`, read from `<config_dir>/../plugins/TAB/`.
+pub fn group_permission_nodes(config_dir: &Path) -> Vec<String> {
+    let dir = files_dir(config_dir);
+    let read = |name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .ok()
+            .and_then(|t| crate::horizon_tab::yaml::parse(&t).ok())
+    };
+    let mut groups: Vec<String> = read("config.yml")
+        .map(|y| y.get("primary-group-finding-list").str_list())
+        .unwrap_or_default();
+    if let Some(y) = read("groups.yml") {
+        groups.extend(y.keys().into_iter().filter(|k| k != "_DEFAULT_"));
+    }
+    groups.sort();
+    groups.dedup();
+    groups.into_iter().map(|g| format!("tab.group.{g}")).collect()
 }
 
 /// A packet the game is about to send `viewer` was seen on its way out (the glue hands the parts

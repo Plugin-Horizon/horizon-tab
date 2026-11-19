@@ -9,7 +9,7 @@ use crate::horizon_tab::out::{Out, Packet};
 use crate::horizon_tab::properties::VALID_PROPERTIES;
 
 /// The TAB version whose commands this follows (shown by `/tab`).
-const TAB_VERSION: &str = "6.2.2";
+const TAB_VERSION: &str = "6.2.2-SNAPSHOT";
 
 /// `PropertyConfiguration.VALID_PROPERTIES` in TAB's order.
 pub const COMMAND_PROPERTIES: [&str; 5] = ["tagprefix", "tagsuffix", "tabprefix", "customtabname", "tabsuffix"];
@@ -751,10 +751,10 @@ fn bossbar(e: &mut Engine, sender: Sender, args: &[String], o: &mut Output) {
         args.to_vec()
     };
     let sub = args[0].to_lowercase();
-    // TAB's own `BossBarSendCommand` is registered with the scoreboard `show` node.
+    // TAB's `BossBarSendCommand` asks `tab.send.bar`.
     let node = match sub.as_str() {
         "announce" => "tab.announce.bar",
-        "send" => "tab.scoreboard.show",
+        "send" => "tab.send.bar",
         "toggle" | "on" | "off" => "tab.bossbar.toggle",
         _ => {
             return o.say(e.message(

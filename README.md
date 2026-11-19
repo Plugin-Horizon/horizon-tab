@@ -16,6 +16,11 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
 
 ## What it does
 
+Only part of the list below is visible on Horizon today: header/footer, one tab list name per player (the same for
+every viewer), boss bars, chat lines, commands and placeholders work. Name tags and sorting (scoreboard teams), the
+sidebar, the below-name and list objectives, ping bars and game-mode updates compute their data but nothing is sent
+to players yet; see Known gaps.
+
 - Reads TAB's own files from `config/tab/` (beside `server.properties`): `config.yml`, `groups.yml`, `users.yml`,
   `animations.yml`, `messages.yml`, `playerdata.yml`. A Bukkit server's `plugins/TAB/` folder can be copied there as it
   is; `/tab player|group ...` writes the same files back. Missing files are created with TAB's defaults.
@@ -77,7 +82,7 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
-- Team prefixes and suffixes are not shown (only the colour); the tab-list and below-name objective slots are dropped.
+- Scoreboard teams are not shown at all (no name tag prefix/suffix or colour, no team sorting); the sidebar and the tab-list and below-name objective slots are dropped; ping and game mode are not sent.
 - The anti-override guard is off (outgoing packets cannot be watched), so other senders' team, latency or name packets are not put back.
 - `%player-version%` is wrong (no protocol read); name completion falls back to plain words.
 - A toggle named like a vanilla command (`/bossbar`) is only reachable as `/tab bossbar`.

@@ -19,6 +19,8 @@ pub struct TabPlayer {
     pub p: Player,
     pub group: String,
     pub bedrock: bool,
+    /// Whether the player's team collides (`/tab setcollision`, else `scoreboard-teams.enable-collision`).
+    pub collision: bool,
     pub version_id: i32,
     pub version_name: String,
 }
@@ -77,6 +79,9 @@ fn builtin_interval(token: &str) -> Option<i64> {
         | "%memory-max-gb%"
         | "%bedrock%" => -1,
         "%vanished%"
+        | "%invisible%"
+        | "%collision%"
+        | "%deaths%"
         | "%worldonline%"
         | "%serveronline%"
         | "%online%"
@@ -313,6 +318,9 @@ impl TabPlaceholders {
             "%group%" => t.group.clone(),
             "%ping%" => p.ping.to_string(),
             "%vanished%" => p.vanished.to_string(),
+            "%invisible%" => p.invisible.to_string(),
+            "%deaths%" => p.deaths.to_string(),
+            "%collision%" => t.collision.to_string(),
             "%gamemode%" => p.game_mode.to_string(),
             "%health%" => ((p.health as f64).ceil() as i64).to_string(),
             "%bedrock%" => t.bedrock.to_string(),
@@ -442,6 +450,19 @@ mod tests {
         assert!(ph.short_met("%world%=world", &ctx));
         assert!(!ph.short_met("%world%=disabledworld", &ctx));
         assert!(ph.short_met("%player-version-id%>=765;%bedrock%=false", &ctx));
+    }
+
+    #[test]
+    fn deaths_invisible_collision_placeholders() {
+        let mut ph = ph();
+        let mut t = player("Steve", 1);
+        t.p.deaths = 7;
+        t.p.invisible = true;
+        t.collision = true;
+        let all = vec![t.clone()];
+        let server = Server::default();
+        let ctx = Ctx { target: &all[0], viewer: &all[0], all: &all, server: &server };
+        assert_eq!(ph.parse("%deaths% %invisible% %collision%", &ctx), "7 true true");
     }
 
     #[test]

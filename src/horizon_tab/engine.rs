@@ -42,6 +42,8 @@ pub struct PlayerIn {
     pub ping: i32,
     pub nickname: Option<String>,
     pub vanished: bool,
+    pub invisible: bool,
+    pub deaths: i32,
     pub entity_id: i32,
     pub protocol: i32,
     /// A bot with no client (a fake player): it is shown to the others but nothing is built or
@@ -465,11 +467,16 @@ impl Engine {
                     game_mode: input.game_mode,
                     op_level: input.op_level,
                     vanished,
+                    invisible: input.invisible,
+                    deaths: input.deaths,
                     entity_id: input.entity_id,
                     joined_at_ms: joined_ms,
                 },
                 group,
                 bedrock,
+                collision: existing
+                    .and_then(|i| self.players[i].collision)
+                    .unwrap_or(self.cfg.teams.enable_collision),
                 version_id: input.protocol,
                 version_name: version_name(input.protocol),
             };

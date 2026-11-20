@@ -83,9 +83,10 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
 - With the Cargo feature `horizon_main_api` (needs a Horizon build that has the calls of main and PR #17980; off by default) ping, nickname, vanished, the sidebar, list names (the player's own view) and team colours and members work; the rest of this list stays.
-- Scoreboard teams are not shown at all (no name tag prefix/suffix or colour, no team sorting); the sidebar and the tab-list and below-name objective slots are dropped; ping and game mode are not sent.
+- With `horizon_team_options_api` (needs `horizon_main_api` and the team setters of branch `api-scoreboard-team-options`, PR #17980 stack) team prefixes, suffixes, name tag visibility, collision rules and friendly fire are set. With `horizon_protocol_api` (branch `api-player-protocol`) `%player-version%` shows the client's version. Both are off by default and were written without a compile.
+- Without `horizon_team_options_api`, scoreboard teams show the colour only (no name tag prefix/suffix, visibility or collision, no team sorting); without `horizon_main_api` they show nothing. The sidebar and the tab-list and below-name objective slots are dropped; ping and game mode are not sent.
 - The anti-override guard is off (outgoing packets cannot be watched), so other senders' team, latency or name packets are not put back.
-- `%player-version%` is wrong (no protocol read). Player-name arguments of `/tab` complete online names; an offline name is still accepted as typed.
+- `%player-version%` is wrong without `horizon_protocol_api` (no protocol read). Player-name arguments of `/tab` complete online names, only for senders with `tab.tabcomplete`; the literal sub-command words are not filtered per sender. An offline name is still accepted as typed.
 - A toggle named like a vanilla command (`/bossbar`) is only reachable as `/tab bossbar`.
 - List names are per player, not per viewer.
 

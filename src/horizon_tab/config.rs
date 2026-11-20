@@ -2,6 +2,7 @@
 //! Only the keys this mod acts on are modelled; [`Config::unsupported`] lists switched-on features
 //! it does not implement, for a warning at start.
 
+use crate::horizon_tab::mysql::MysqlConfig;
 use crate::horizon_tab::yaml::Yaml;
 use std::collections::HashMap;
 
@@ -130,6 +131,7 @@ pub struct Config {
     pub permission_refresh_ms: i64,
     pub minimessage: bool,
     pub debug: bool,
+    pub mysql: MysqlConfig,
     pub unsupported: Vec<String>,
     /// Proxy-only keys that are switched on (`proxy-support.enabled`, `use-*`): read and ignored on a
     /// backend, so no warning, only a note at start.
@@ -213,6 +215,12 @@ pub const KEYS_READ: &[&str] = &[
     "global-playerlist.enabled",
     "per-world-playerlist.enabled",
     "mysql.enabled",
+    "mysql.host",
+    "mysql.port",
+    "mysql.database",
+    "mysql.username",
+    "mysql.password",
+    "mysql.useSSL",
     "proxy-support.enabled",
     "use-bukkit-permissions-manager",
     "use-online-uuid-in-tablist",
@@ -402,6 +410,7 @@ impl Config {
             permission_refresh_ms: y.get("permission-refresh-interval").i64_or(1000),
             minimessage: y.at(&["components", "minimessage-support"]).bool_or(true),
             debug: y.get("debug").bool_or(false),
+            mysql: MysqlConfig::from_yaml(y.get("mysql")),
             unsupported: Vec::new(),
             proxy_only_on: Vec::new(),
         };
@@ -419,7 +428,6 @@ impl Config {
             ("layout", "layout"),
             ("global-playerlist", "global-playerlist"),
             ("per-world-playerlist", "per-world-playerlist"),
-            ("mysql", "mysql"),
         ] {
             if y.at(&[key, "enabled"]).bool_or(false) {
                 cfg.unsupported.push(what.to_owned());
@@ -473,6 +481,8 @@ mod tests {
             ]
         );
         assert!(c.unsupported.is_empty());
+        assert!(!c.mysql.enabled);
+        assert_eq!(c.mysql.port, 3306);
         assert!(c.minimessage);
     }
 

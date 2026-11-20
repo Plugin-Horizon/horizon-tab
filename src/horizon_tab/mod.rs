@@ -13,6 +13,7 @@ pub mod config;
 pub mod datefmt;
 pub mod engine;
 pub mod integration;
+pub mod mysql;
 pub mod out;
 pub mod placeholders;
 pub mod properties;

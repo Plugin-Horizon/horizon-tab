@@ -34,6 +34,9 @@ use crate::horizon_tab::out::{NumberFmt, ObjectiveMethod};
 use mod_api::{
     ClientboundPlayPacket, Identifier, ScoreHolder, Sidebar, SidebarLine, TeamColor,
 };
+#[cfg(feature = "horizon_team_options_api")]
+use mod_api::{TeamCollisionRule, TeamVisibility};
+use crate::horizon_tab::out::TeamParams;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -155,6 +158,16 @@ fn nickname_of(host: &dyn ServerHost, player: PlayerRef) -> Option<String> {
 fn nickname_of(_: &dyn ServerHost, _: PlayerRef) -> Option<String> {
     None
 }
+// `player_protocol_version` (#18797, branch `api-player-protocol`) is not on the pinned SDK. Without the
+// feature `%player-version%` shows protocol 0 (no version name).
+#[cfg(feature = "horizon_protocol_api")]
+fn protocol_of(host: &dyn ServerHost, player: PlayerRef) -> i32 {
+    player.protocol_version(host).unwrap_or(0)
+}
+#[cfg(not(feature = "horizon_protocol_api"))]
+fn protocol_of(_: &dyn ServerHost, _: PlayerRef) -> i32 {
+    0
+}
 /// `player_hide` hides a player from everyone below a permission level; any level reads as vanished.
 #[cfg(feature = "horizon_main_api")]
 fn vanished_of(host: &dyn ServerHost, player: PlayerRef) -> bool {
@@ -194,8 +207,7 @@ fn player_in(host: &dyn ServerHost, player: PlayerRef) -> PlayerIn {
             .stat(host, StatType::Custom, "minecraft:deaths")
             .unwrap_or(0),
         entity_id: entity.id() as i32,
-        // TODO(arismoko-api: player_client_protocol): no protocol read; `%player-version%` is wrong.
-        protocol: 0,
+        protocol: protocol_of(host, player),
         fake: player.is_fake(host).unwrap_or(false),
     }
 }
@@ -276,8 +288,14 @@ fn send(host: &mut dyn ServerHost, packets: Vec<Packet>) {
             // is not wired: other senders' team, latency, game mode and name packets are not
             // put back.
             Out::DisplayNames(entries) => display_names(host, to, entries),
-            Out::TeamCreate { name, params, players } => team(host, &name, params.color, Some(players)),
-            Out::TeamUpdate { name, params } => team(host, &name, params.color, None),
+            Out::TeamCreate { name, params, players } => {
+                team(host, &name, params.color, Some(players));
+                team_options(host, &name, &params);
+            }
+            Out::TeamUpdate { name, params } => {
+                team(host, &name, params.color, None);
+                team_options(host, &name, &params);
+            }
             Out::TeamRemove { name } => team_remove(host, &name),
             out @ (Out::Objective { .. } | Out::DisplaySlot { .. } | Out::Score { .. } | Out::ResetScore { .. }) => {
                 if state().views.entry(to).or_default().apply(out) {
@@ -299,6 +317,9 @@ struct State {
     teams: HashMap<String, Option<i32>>,
     /// Player name -> team they were put on.
     members: HashMap<String, String>,
+    /// Team name -> the options last applied to it (prefix, suffix, visibility, collision, friendly fire).
+    #[cfg_attr(not(feature = "horizon_team_options_api"), allow(dead_code))]
+    team_options: HashMap<String, TeamParams>,
     /// Player -> list name JSON as last set (None = real name).
     list_names: HashMap<u128, Option<String>>,
     views: HashMap<u128, View>,
@@ -492,6 +513,57 @@ fn team_remove(host: &mut dyn ServerHost, name: &str) {
     let mut st = state();
     st.teams.remove(name);
     st.members.retain(|_, team| team != name);
+    #[cfg(feature = "horizon_team_options_api")]
+    st.team_options.remove(name);
+}
+
+/// The team options of TAB's team packets beyond the colour: prefix, suffix, name tag visibility,
+/// collision rule and friendly fire (`team_set_prefix` and the setters of the branch
+/// `api-scoreboard-team-options`, #18817). Without the feature the packet's options are dropped.
+// HMOD-GAP(team_prefix_suffix): see `team` above; without `horizon_team_options_api` only the colour shows.
+#[cfg(not(feature = "horizon_team_options_api"))]
+fn team_options(host: &mut dyn ServerHost, name: &str, params: &TeamParams) {
+    let _ = (host, name, params);
+}
+
+#[cfg(feature = "horizon_team_options_api")]
+fn team_options(host: &mut dyn ServerHost, name: &str, params: &TeamParams) {
+    let Some(handle) = host.team(name) else {
+        return;
+    };
+    if state().team_options.get(name) == Some(params) {
+        return;
+    }
+    let prefix = text_json(&*host, &params.prefix);
+    let suffix = text_json(&*host, &params.suffix);
+    let _ = host.team_set_prefix(handle.clone(), prefix);
+    let _ = host.team_set_suffix(handle.clone(), suffix);
+    let _ = host.team_set_name_tag_visibility(handle.clone(), visibility_of(params.visibility));
+    let _ = host.team_set_collision_rule(handle.clone(), collision_of(params.collision));
+    let _ = host.team_set_friendly_fire(handle, (params.options & 1) != 0);
+    state().team_options.insert(name.to_owned(), params.clone());
+}
+
+/// `Team.Visibility` as TAB's number (0 always, 1 never, 2 hide for other teams, 3 hide for own team).
+#[cfg(feature = "horizon_team_options_api")]
+fn visibility_of(index: i32) -> TeamVisibility {
+    match index {
+        1 => TeamVisibility::Never,
+        2 => TeamVisibility::HideForOtherTeams,
+        3 => TeamVisibility::HideForOwnTeam,
+        _ => TeamVisibility::Always,
+    }
+}
+
+/// `Team.CollisionRule` as TAB's number (0 always, 1 never, 2 push other teams, 3 push own team).
+#[cfg(feature = "horizon_team_options_api")]
+fn collision_of(index: i32) -> TeamCollisionRule {
+    match index {
+        1 => TeamCollisionRule::Never,
+        2 => TeamCollisionRule::PushOtherTeams,
+        3 => TeamCollisionRule::PushOwnTeam,
+        _ => TeamCollisionRule::Always,
+    }
 }
 
 /// TAB's tab list names. The core sends them per viewer, `player_set_list_name` is the same for
@@ -864,5 +936,19 @@ mod tests {
             });
         }
         assert_eq!(view.sidebar_rows().unwrap().1.len(), 15);
+    }
+
+    // TAB's team numbers map to the vocabulary's variants, in TAB's order (0 is the default).
+    #[cfg(feature = "horizon_team_options_api")]
+    #[test]
+    fn team_numbers_map_to_visibility_and_collision() {
+        assert_eq!(visibility_of(0), TeamVisibility::Always);
+        assert_eq!(visibility_of(1), TeamVisibility::Never);
+        assert_eq!(visibility_of(2), TeamVisibility::HideForOtherTeams);
+        assert_eq!(visibility_of(3), TeamVisibility::HideForOwnTeam);
+        assert_eq!(collision_of(0), TeamCollisionRule::Always);
+        assert_eq!(collision_of(1), TeamCollisionRule::Never);
+        assert_eq!(collision_of(2), TeamCollisionRule::PushOtherTeams);
+        assert_eq!(collision_of(3), TeamCollisionRule::PushOwnTeam);
     }
 }

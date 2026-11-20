@@ -16,3 +16,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Calls that exist on Horizon main only (player latency/nickname/hidden reads, per-player sidebar, tab list
 # name, scoreboard teams, send packet). Off by default: the pinned SDK does not have them.
 horizon_main_api = []
+# `player_protocol_version` (PR branch `api-player-protocol`, #18797): `%player-version%` and `%player-version-id%`.
+horizon_protocol_api = []
+# Team prefix, suffix, name tag visibility, collision rule and friendly fire (branch `api-scoreboard-team-options`,
+# #18817, stacked on #17980): needs the team calls of `horizon_main_api`.
+horizon_team_options_api = ["horizon_main_api"]

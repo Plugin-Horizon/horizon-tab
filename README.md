@@ -24,6 +24,8 @@ to players yet; see Known gaps.
 - Reads TAB's own files from `config/tab/` (beside `server.properties`): `config.yml`, `groups.yml`, `users.yml`,
   `animations.yml`, `messages.yml`, `playerdata.yml`. A Bukkit server's `plugins/TAB/` folder can be copied there as it
   is; `/tab player|group ...` writes the same files back. Missing files are created with TAB's defaults.
+- With `mysql.enabled: true` groups and users are kept in the MySQL tables `tab_groups` and `tab_users` instead (TAB's
+  layout); `/tab mysql upload|download` copy between the tables and the two files. Not compiled yet (see Known gaps).
 - Tab list names: `tabprefix` + `customtabname` + `tabsuffix`, looked up as TAB does (per world, per server, user by
   name, user by UUID, group, `_DEFAULT_`).
 - Name tags: one team per player with `tagprefix` / `tagsuffix`, the team colour taken from the prefix's last colour,
@@ -38,7 +40,7 @@ to players yet; see Known gaps.
   `<gradient:#RRGGBB>text</gradient:#RRGGBB>`) and, with `components.minimessage-support`, common MiniMessage tags.
 - Commands, as TAB 6.2.2 has them: `/tab reload | parse | player | playeruuid | group | groups | debug | dump | cpu |
   mysql | scoreboard | bossbar | nametag | setcollision` and the scoreboard toggle command (`/sb`), with TAB's
-  permission nodes (`tab.admin` allows all). `cpu`, `dump` and `mysql` need parts that are not ported, see the Known gaps section.
+  permission nodes (`tab.admin` allows all). `cpu` and `dump` need parts that are not ported, see the Known gaps section.
 
 What is ported and what is not: the Known gaps section. What Horizon would need to do it without internals:
 the Known gaps section.
@@ -89,6 +91,9 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 - `%player-version%` is wrong without `horizon_protocol_api` (no protocol read). Player-name arguments of `/tab` complete online names, only for senders with `tab.tabcomplete`; the literal sub-command words are not filtered per sender. An offline name is still accepted as typed.
 - A toggle named like a vanilla command (`/bossbar`) is only reachable as `/tab bossbar`.
 - List names are per player, not per viewer.
+- MySQL storage (`mysql.enabled`) is blind-written and not compiled yet. Its database calls run on the server thread (TAB uses a
+  thread of its own), so a join or an upload waits for them. `/tab dump` does not show the `mysql` section. Rows with
+  unknown properties get no `checkProperty` warning.
 
 ## Licence and origin
 

@@ -78,6 +78,34 @@ pub fn group_permission_nodes(config_dir: &Path) -> Vec<String> {
     groups.into_iter().map(|g| format!("tab.group.{g}")).collect()
 }
 
+/// The nodes of `permission:<node>` and `!permission:<node>` conditions in `config.yml` (display,
+/// disable and visibility conditions). The game refuses a typed query of an undeclared node, so
+/// each one is declared here like the others.
+pub fn condition_permission_nodes(config_dir: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(files_dir(config_dir).join("config.yml")).unwrap_or_default();
+    permission_nodes_in(&text)
+}
+
+/// The node after each `permission:` in `text`, up to the first character that ends a condition
+/// (space, quote, `|`, `&`, brackets, `=`, `,`, `#`). Nodes with a placeholder are skipped.
+pub fn permission_nodes_in(text: &str) -> Vec<String> {
+    let mut nodes = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("permission:") {
+        rest = &rest[at + "permission:".len()..];
+        let node: String = rest
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !matches!(c, '|' | '&' | '\'' | '"' | '(' | ')' | '=' | ',' | '#'))
+            .collect();
+        if !node.is_empty() && !node.contains('%') && !node.contains('{') {
+            nodes.push(node);
+        }
+    }
+    nodes.sort();
+    nodes.dedup();
+    nodes
+}
+
 /// A packet the game is about to send `viewer` was seen on its way out (the glue hands the parts
 /// of a clientbound packet it understands here). Each function answers what TAB wants instead, or
 /// `None`/`false` to let the packet pass.
@@ -574,6 +602,16 @@ fn register_tab_expansion() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn condition_permission_nodes_are_read_from_the_conditions() {
+        let text = "display-condition: permission:tab.staff\n\
+                    disable-condition: '!permission:tab.group.vip|%world%=x'\n\
+                    other: permission:tab.staff\n\
+                    text: '%permission:tab.skip%'";
+        assert_eq!(permission_nodes_in(text), vec!["tab.group.vip".to_owned(), "tab.staff".to_owned()]);
+        assert!(permission_nodes_in("no conditions here").is_empty());
+    }
 
     #[test]
     fn files_are_read_from_the_server_plugin_folder() {

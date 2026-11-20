@@ -603,6 +603,7 @@ impl Hooks for Mod {
         names.push("tab.bypass".to_owned());
         names.push("tab.seevanished".to_owned());
         names.extend(api::group_permission_nodes(Path::new("config")));
+        names.extend(api::condition_permission_nodes(Path::new("config")));
         for name in names {
             let node = PermissionNode::new(name, PermissionValueType::Boolean);
             let _ = event.nodes.add(node, NodeDefault::Level(PermissionLevel::from_level(1)));
@@ -633,6 +634,13 @@ impl Hooks for Mod {
         let mut words: Vec<&str> = line.split(' ').collect();
         let root = words.remove(0);
         if !root.eq_ignore_ascii_case("tab") || words.is_empty() {
+            return;
+        }
+        // TAB's `/tab` completes nothing for a sender without `tab.tabcomplete` (or `tab.admin`).
+        let may_complete = ["tab.admin", "tab.tabcomplete"]
+            .iter()
+            .any(|node| host_answer(host, event.player, node) == Some(true));
+        if !may_complete {
             return;
         }
         let usages: Vec<String> = api::commands().into_iter().map(|(usage, _)| usage).collect();

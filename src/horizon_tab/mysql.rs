@@ -2,6 +2,7 @@
 //! `MySQLGroupConfiguration`, `MySQLUserConfiguration` and `MySQLCommand`, Apache-2.0, see NOTICE).
 //! Groups and users live in the tables `tab_groups` and `tab_users`, with TAB's columns.
 
+use crate::horizon_tab::properties::PropertyFile;
 use crate::horizon_tab::yaml::Yaml;
 use std::fmt;
 
@@ -47,6 +48,174 @@ impl fmt::Debug for MysqlConfig {
     }
 }
 
+pub const GROUPS_TABLE: &str = "tab_groups";
+pub const USERS_TABLE: &str = "tab_users";
+
+/// TAB's `CREATE TABLE` statements (`MySQLGroupConfiguration`, `MySQLUserConfiguration`).
+pub const CREATE_GROUPS: &str = "create table if not exists tab_groups (`group` varchar(64), `property` varchar(16), `value` varchar(1024), world varchar(64), server varchar(64))";
+pub const CREATE_USERS: &str = "create table if not exists tab_users (`user` varchar(64), `property` varchar(16), `value` varchar(1024), world varchar(64), server varchar(64))";
+
+/// One statement with its positional parameters (`None` is SQL NULL).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stmt {
+    pub sql: String,
+    pub params: Vec<Option<String>>,
+}
+
+/// One stored setting: TAB's row (name, property, value, world, server). A NULL value
+/// stands for no value, as TAB's `put(property, null)` does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Row {
+    pub name: String,
+    pub property: String,
+    pub value: Option<String>,
+    pub world: Option<String>,
+    pub server: Option<String>,
+}
+
+/// The table and its name column for a category (`group` or `user`).
+pub fn table_of(category: &str) -> (&'static str, &'static str) {
+    if category == "group" {
+        (GROUPS_TABLE, "group")
+    } else {
+        (USERS_TABLE, "user")
+    }
+}
+
+/// Reads every row of the category's table.
+pub fn select_all(category: &str) -> Stmt {
+    let (table, _) = table_of(category);
+    Stmt {
+        sql: format!("SELECT `group`, `property`, `value`, `world`, `server` FROM `{table}`"),
+        params: Vec::new(),
+    }
+}
+
+/// Reads the rows of one name (`MySQLUserConfiguration.load` reads by name, then by UUID).
+pub fn select_name(category: &str, name: &str) -> Stmt {
+    let (table, column) = table_of(category);
+    Stmt {
+        sql: format!("SELECT `{column}`, `property`, `value`, `world`, `server` FROM `{table}` WHERE `{column}` = ?"),
+        params: vec![Some(name.to_owned())],
+    }
+}
+
+/// A scope condition: `= ?` with its value, or `IS NULL` (TAB's `querySymbol`; the JDBC driver
+/// sends `is NULL` for a null parameter, which a server-side prepared statement cannot bind).
+fn scope(column: &str, value: Option<&str>, params: &mut Vec<Option<String>>) -> String {
+    match value {
+        Some(v) => {
+            params.push(Some(v.to_owned()));
+            format!("{column} = ?")
+        }
+        None => format!("{column} IS NULL"),
+    }
+}
+
+/// `setProperty` of the MySQL configurations: the row of that property in that scope goes, then
+/// the new value is inserted (none for a removal).
+pub fn set_statements(
+    category: &str,
+    name: &str,
+    property: &str,
+    value: Option<&str>,
+    world: Option<&str>,
+    server: Option<&str>,
+) -> Vec<Stmt> {
+    let (table, column) = table_of(category);
+    let mut params = vec![Some(name.to_owned()), Some(property.to_owned())];
+    let world_cond = scope("world", world, &mut params);
+    let server_cond = scope("server", server, &mut params);
+    let mut out = vec![Stmt {
+        sql: format!("delete from `{table}` where `{column}` = ? and `property` = ? and {world_cond} and {server_cond}"),
+        params,
+    }];
+    if let Some(v) = value {
+        out.push(Stmt {
+            sql: format!("insert into `{table}` (`{column}`, `property`, `value`, `world`, `server`) values (?, ?, ?, ?, ?)"),
+            params: vec![
+                Some(name.to_owned()),
+                Some(property.to_owned()),
+                Some(v.to_owned()),
+                world.map(str::to_owned),
+                server.map(str::to_owned),
+            ],
+        });
+    }
+    out
+}
+
+/// `remove` of the MySQL configurations: every row of the name.
+pub fn remove_statement(category: &str, name: &str) -> Stmt {
+    let (table, column) = table_of(category);
+    Stmt {
+        sql: format!("delete from `{table}` where `{column}` = ?"),
+        params: vec![Some(name.to_owned())],
+    }
+}
+
+/// The first step of `/tab mysql upload`.
+pub fn delete_all(category: &str) -> Stmt {
+    let (table, _) = table_of(category);
+    Stmt {
+        sql: format!("DELETE FROM {table}"),
+        params: Vec::new(),
+    }
+}
+
+/// A row as the table returns it (name, property, value, world, server). A row without a name or
+/// a property is skipped.
+pub fn row_of(cols: (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)) -> Option<Row> {
+    let (name, property, value, world, server) = cols;
+    Some(Row {
+        name: name?,
+        property: property?,
+        value,
+        world,
+        server,
+    })
+}
+
+/// The text TAB stores for a value: scalars as Java prints them, a list joined with line breaks.
+/// Null and mappings have none.
+fn value_text(value: &Yaml) -> Option<String> {
+    match value {
+        Yaml::List(items) => Some(items.iter().filter_map(Yaml::as_str).collect::<Vec<_>>().join("\n")),
+        Yaml::Map(_) | Yaml::Null => None,
+        scalar => scalar.as_str(),
+    }
+}
+
+fn push_settings(out: &mut Vec<Row>, name: &str, section: &Yaml, world: Option<&str>, server: Option<&str>) {
+    for (property, value) in section.entries() {
+        if let Some(text) = value_text(value) {
+            out.push(Row {
+                name: name.to_owned(),
+                property: property.clone(),
+                value: Some(text),
+                world: world.map(str::to_owned),
+                server: server.map(str::to_owned),
+            });
+        }
+    }
+}
+
+/// The rows `/tab mysql upload` writes for a file: per name, the global settings, then the
+/// per-world ones, then the per-server ones (`MySQLCommand.upload`).
+pub fn rows_of(file: &PropertyFile) -> Vec<Row> {
+    let mut out = Vec::new();
+    for name in file.entries() {
+        push_settings(&mut out, &name, file.root.get(&name), None, None);
+        for (world, sections) in file.root.get("per-world").entries() {
+            push_settings(&mut out, &name, sections.get(&name), Some(world.as_str()), None);
+        }
+        for (server, sections) in file.root.get("per-server").entries() {
+            push_settings(&mut out, &name, sections.get(&name), None, Some(server.as_str()));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +255,132 @@ mod tests {
         let text = format!("{:?}", MysqlConfig::from_yaml(y.get("mysql")));
         assert!(text.contains("<redacted>"));
         assert!(!text.contains("s3cret-test"));
+    }
+
+    fn stmt(sql: &str, params: &[Option<&str>]) -> Stmt {
+        Stmt {
+            sql: sql.to_owned(),
+            params: params.iter().map(|p| p.map(str::to_owned)).collect(),
+        }
+    }
+
+    #[test]
+    fn schema_text() {
+        assert_eq!(
+            CREATE_GROUPS,
+            "create table if not exists tab_groups (`group` varchar(64), `property` varchar(16), `value` varchar(1024), world varchar(64), server varchar(64))"
+        );
+        assert_eq!(
+            CREATE_USERS,
+            "create table if not exists tab_users (`user` varchar(64), `property` varchar(16), `value` varchar(1024), world varchar(64), server varchar(64))"
+        );
+    }
+
+    #[test]
+    fn select_texts() {
+        assert_eq!(
+            select_all("group"),
+            stmt("SELECT `group`, `property`, `value`, `world`, `server` FROM `tab_groups`", &[])
+        );
+        assert_eq!(
+            select_name("user", "steve"),
+            stmt(
+                "SELECT `user`, `property`, `value`, `world`, `server` FROM `tab_users` WHERE `user` = ?",
+                &[Some("steve")]
+            )
+        );
+    }
+
+    #[test]
+    fn set_global_user_value() {
+        assert_eq!(
+            set_statements("user", "steve", "tabprefix", Some("&c"), None, None),
+            vec![
+                stmt(
+                    "delete from `tab_users` where `user` = ? and `property` = ? and world IS NULL and server IS NULL",
+                    &[Some("steve"), Some("tabprefix")]
+                ),
+                stmt(
+                    "insert into `tab_users` (`user`, `property`, `value`, `world`, `server`) values (?, ?, ?, ?, ?)",
+                    &[Some("steve"), Some("tabprefix"), Some("&c"), None, None]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_scoped_group_value_and_removal() {
+        assert_eq!(
+            set_statements("group", "admin", "tagprefix", Some("&4"), Some("world"), Some("lobby")),
+            vec![
+                stmt(
+                    "delete from `tab_groups` where `group` = ? and `property` = ? and world = ? and server = ?",
+                    &[Some("admin"), Some("tagprefix"), Some("world"), Some("lobby")]
+                ),
+                stmt(
+                    "insert into `tab_groups` (`group`, `property`, `value`, `world`, `server`) values (?, ?, ?, ?, ?)",
+                    &[Some("admin"), Some("tagprefix"), Some("&4"), Some("world"), Some("lobby")]
+                ),
+            ]
+        );
+        assert_eq!(
+            set_statements("group", "admin", "tagprefix", None, None, Some("lobby")),
+            vec![stmt(
+                "delete from `tab_groups` where `group` = ? and `property` = ? and world IS NULL and server = ?",
+                &[Some("admin"), Some("tagprefix"), Some("lobby")]
+            )]
+        );
+    }
+
+    #[test]
+    fn remove_and_upload_texts() {
+        assert_eq!(
+            remove_statement("group", "admin"),
+            stmt("delete from `tab_groups` where `group` = ?", &[Some("admin")])
+        );
+        assert_eq!(remove_statement("user", "Steve"), stmt("delete from `tab_users` where `user` = ?", &[Some("Steve")]));
+        assert_eq!(delete_all("group"), stmt("DELETE FROM tab_groups", &[]));
+        assert_eq!(delete_all("user"), stmt("DELETE FROM tab_users", &[]));
+    }
+
+    #[test]
+    fn row_mapping_skips_rows_without_name_or_property() {
+        assert_eq!(
+            row_of((Some("Admin".into()), Some("tabprefix".into()), None, Some("world1".into()), None)),
+            Some(Row {
+                name: "Admin".into(),
+                property: "tabprefix".into(),
+                value: None,
+                world: Some("world1".into()),
+                server: None,
+            })
+        );
+        assert_eq!(row_of((None, Some("tabprefix".into()), None, None, None)), None);
+        assert_eq!(row_of((Some("Admin".into()), None, None, None, None)), None);
+    }
+
+    #[test]
+    fn upload_rows_of_a_file() {
+        let file = PropertyFile::from_str(
+            "default:\n  tabprefix: '&7'\n  tabsuffix:\n  - 'a'\n  - 'b'\n  tagprefix:\nper-world:\n  nether:\n    default:\n      tabprefix: '&c'\nper-server:\n  lobby:\n    default:\n      customtabname: 5\n",
+            "group",
+        )
+        .unwrap();
+        let row = |name: &str, property: &str, value: &str, world: Option<&str>, server: Option<&str>| Row {
+            name: name.into(),
+            property: property.into(),
+            value: Some(value.into()),
+            world: world.map(str::to_owned),
+            server: server.map(str::to_owned),
+        };
+        assert_eq!(
+            rows_of(&file),
+            vec![
+                row("default", "tabprefix", "&7", None, None),
+                row("default", "tabsuffix", "a\nb", None, None),
+                row("default", "tabprefix", "&c", Some("nether"), None),
+                row("default", "customtabname", "5", None, Some("lobby")),
+            ]
+        );
     }
 }

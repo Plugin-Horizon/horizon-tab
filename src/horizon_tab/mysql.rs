@@ -2,9 +2,12 @@
 //! `MySQLGroupConfiguration`, `MySQLUserConfiguration` and `MySQLCommand`, Apache-2.0, see NOTICE).
 //! Groups and users live in the tables `tab_groups` and `tab_users`, with TAB's columns.
 
-use crate::horizon_tab::properties::PropertyFile;
+use crate::horizon_tab::properties::{PropertyFile, Properties};
 use crate::horizon_tab::yaml::Yaml;
+use mysql::prelude::Queryable;
+use mysql::{OptsBuilder, Params, Pool, SslOpts, Value};
 use std::fmt;
+use std::sync::Arc;
 
 /// The `mysql` section, read as `MySQLConfiguration.fromSection` reads it. The defaults are TAB's
 /// own (a placeholder login); the section is off unless `enabled` is true.
@@ -214,6 +217,109 @@ pub fn rows_of(file: &PropertyFile) -> Vec<Row> {
         }
     }
     out
+}
+
+/// `MySQLGroupConfiguration`'s startup warning for an empty `tab_groups`.
+const EMPTY_WARNING: &str = "[MySQL] Using MySQL to store groups and users, however, the database is empty. You can get started by uploading existing data in files using \"/tab mysql upload\". Further modifications can be done using property commands (/tab <group / player> <name> <property> <value...>).";
+
+/// A pool of connections to TAB's database (the `mysql` crate, as husksync and luckperms use it).
+pub struct Db {
+    pool: Pool,
+}
+
+impl fmt::Debug for Db {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Db")
+    }
+}
+
+/// The columns of a row read by `Db::rows`, in the order of `select_all` and `select_name`.
+type Columns = (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+
+/// The `mysql` crate's errors do not carry the password.
+fn db_err(e: impl fmt::Display) -> String {
+    format!("database: {e}")
+}
+
+fn params_of(params: &[Option<String>]) -> Params {
+    if params.is_empty() {
+        return Params::Empty;
+    }
+    Params::Positional(
+        params
+            .iter()
+            .map(|p| match p {
+                Some(s) => Value::Bytes(s.clone().into_bytes()),
+                None => Value::NULL,
+            })
+            .collect(),
+    )
+}
+
+impl Db {
+    /// Opens the pool (the connection is made now) and creates both tables, as TAB's constructors do.
+    pub fn connect(cfg: &MysqlConfig) -> Result<Db, String> {
+        let mut opts = OptsBuilder::new()
+            .ip_or_hostname(Some(cfg.host.clone()))
+            .tcp_port(cfg.port)
+            .user(Some(cfg.username.clone()))
+            .pass(Some(cfg.password.clone()))
+            .db_name(Some(cfg.database.clone()));
+        if cfg.use_ssl {
+            opts = opts.ssl_opts(Some(SslOpts::default()));
+        }
+        let pool = Pool::new(opts).map_err(db_err)?;
+        let db = Db { pool };
+        for sql in [CREATE_GROUPS, CREATE_USERS] {
+            db.exec(&Stmt {
+                sql: sql.to_owned(),
+                params: Vec::new(),
+            })?;
+        }
+        Ok(db)
+    }
+
+    pub fn exec(&self, stmt: &Stmt) -> Result<(), String> {
+        let mut conn = self.pool.get_conn().map_err(db_err)?;
+        conn.exec_drop(stmt.sql.as_str(), params_of(&stmt.params)).map_err(db_err)
+    }
+
+    pub fn rows(&self, stmt: &Stmt) -> Result<Vec<Row>, String> {
+        let mut conn = self.pool.get_conn().map_err(db_err)?;
+        let found: Vec<Columns> = conn.exec(stmt.sql.as_str(), params_of(&stmt.params)).map_err(db_err)?;
+        Ok(found.into_iter().filter_map(row_of).collect())
+    }
+}
+
+/// `Configs`: with `mysql.enabled`, the groups and the users come from the database and the files
+/// are not read. A failure (connecting, the tables, reading the groups) keeps the files, as TAB does.
+pub fn attach(cfg: &MysqlConfig, props: &mut Properties, warnings: &mut Vec<String>) {
+    if !cfg.enabled {
+        return;
+    }
+    let db = match Db::connect(cfg) {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            warnings.push(format!("Failed to connect to MySQL: {e}"));
+            return;
+        }
+    };
+    let rows = match db.rows(&select_all("group")) {
+        Ok(rows) => rows,
+        Err(e) => {
+            warnings.push(format!("Failed to connect to MySQL: {e}"));
+            return;
+        }
+    };
+    if rows.is_empty() {
+        warnings.push(EMPTY_WARNING.to_owned());
+    }
+    let mut groups = PropertyFile::database("group", db.clone());
+    for row in &rows {
+        groups.put_row(row);
+    }
+    props.groups = groups;
+    props.users = PropertyFile::database("user", db);
 }
 
 #[cfg(test)]

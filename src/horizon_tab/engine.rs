@@ -10,6 +10,7 @@
 
 use crate::horizon_tab::config::{Board, Config};
 use crate::horizon_tab::integration;
+use crate::horizon_tab::mysql;
 use crate::horizon_tab::out::{BossOut, NumberFmt, ObjectiveMethod, Out, Packet, TeamParams};
 use crate::horizon_tab::placeholders::{self, uuid_string, Player, Server};
 use crate::horizon_tab::properties::{Properties, PropertyFile};
@@ -252,10 +253,12 @@ impl Engine {
                 ..PropertyFile::default()
             }
         });
+        let mut props = Properties { groups, users };
+        mysql::attach(&cfg.mysql, &mut props, &mut warnings);
         let mut engine = Engine::new(
             dir.to_owned(),
             cfg,
-            Properties { groups, users },
+            props,
             animations,
             messages,
             playerdata,

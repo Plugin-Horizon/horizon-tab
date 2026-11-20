@@ -5,8 +5,10 @@
 //! `_DEFAULT_`; users by name, then by UUID, then the player's group in `groups.yml`.
 //! Sections and keys are matched without case. `/tab player|group` edits write the same files.
 
+use crate::horizon_tab::mysql::{self, Db, Row, Stmt};
 use crate::horizon_tab::yaml::{self, Yaml};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const DEFAULT_GROUP: &str = "_DEFAULT_";
 pub const VALID_PROPERTIES: [&str; 5] = ["tabprefix", "customtabname", "tabsuffix", "tagprefix", "tagsuffix"];
@@ -20,6 +22,12 @@ pub struct PropertyFile {
     /// Set when the file exists but could not be read: it is then never saved, so an edit
     /// cannot replace its content with an empty tree (TAB marks such a file broken too).
     pub broken: Option<String>,
+    /// The MySQL database this file is stored in (`mysql.enabled`); None for a YAML file.
+    pub db: Option<Arc<Db>>,
+    /// Statements of the changes not written yet; `save` writes them to `db`.
+    pub pending: Vec<Stmt>,
+    /// Worlds and servers match by exact name, as TAB's MySQL configurations do (no `*` keys).
+    pub exact_scope: bool,
 }
 
 /// A found value and where it came from (`group=Player, world=world1`).
@@ -41,7 +49,19 @@ impl PropertyFile {
             path: Some(path.to_owned()),
             category,
             broken: None,
+            ..PropertyFile::default()
         })
+    }
+
+    /// The groups (`category` "group") or the users ("user") kept in a MySQL table.
+    pub fn database(category: &'static str, db: Arc<Db>) -> PropertyFile {
+        PropertyFile {
+            root: Yaml::empty_map(),
+            category,
+            db: Some(db),
+            exact_scope: true,
+            ..PropertyFile::default()
+        }
     }
 
     pub fn from_str(text: &str, category: &'static str) -> Result<PropertyFile, String> {
@@ -50,10 +70,23 @@ impl PropertyFile {
             path: None,
             category,
             broken: None,
+            ..PropertyFile::default()
         })
     }
 
-    pub fn save(&self) -> Result<(), String> {
+    /// Writes the file, or for a database the queued statements (a failing one and the rest stay
+    /// queued for the next save).
+    pub fn save(&mut self) -> Result<(), String> {
+        if let Some(db) = self.db.clone() {
+            let pending = std::mem::take(&mut self.pending);
+            for (i, stmt) in pending.iter().enumerate() {
+                if let Err(e) = db.exec(stmt) {
+                    self.pending = pending[i..].to_vec();
+                    return Err(e);
+                }
+            }
+            return Ok(());
+        }
         if let Some(why) = &self.broken {
             return Err(format!("the file could not be read ({why}), not saving"));
         }
@@ -71,7 +104,7 @@ impl PropertyFile {
             .get("per-world")
             .keys()
             .into_iter()
-            .find(|k| group_matches(k, world))
+            .find(|k| self.scope_matches(k, world))
     }
 
     fn server_group(&self, server: Option<&str>) -> Option<String> {
@@ -80,11 +113,34 @@ impl PropertyFile {
             .get("per-server")
             .keys()
             .into_iter()
-            .find(|k| group_matches(k, server))
+            .find(|k| self.scope_matches(k, server))
+    }
+
+    fn scope_matches(&self, key: &str, name: &str) -> bool {
+        if self.exact_scope {
+            key == name
+        } else {
+            group_matches(key, name)
+        }
+    }
+
+    /// TAB's MySQL users have no `_DEFAULT_` entry (`MySQLUserConfiguration.getProperty`).
+    fn db_user(&self) -> bool {
+        self.exact_scope && self.category == "user"
+    }
+
+    /// The name as the table keeps it: lower case, except `_DEFAULT_` of groups.
+    pub fn db_name(&self, name: &str) -> String {
+        if self.category == "group" && name == DEFAULT_GROUP {
+            name.to_owned()
+        } else {
+            name.to_lowercase()
+        }
     }
 
     pub fn get(&self, name: &str, property: &str, world: Option<&str>, server: Option<&str>) -> Option<Found> {
         let cat = self.category;
+        let db_user = self.db_user();
         let try_at = |node: &Yaml, entry: &str, source: String| -> Option<Found> {
             let v = node.get(entry).get(property);
             let value = match v {
@@ -100,8 +156,10 @@ impl PropertyFile {
             if let Some(f) = try_at(node, name, format!("{cat}={name}, world={w}")) {
                 return Some(f);
             }
-            if let Some(f) = try_at(node, DEFAULT_GROUP, format!("{cat}={DEFAULT_GROUP}, world={w}")) {
-                return Some(f);
+            if !db_user {
+                if let Some(f) = try_at(node, DEFAULT_GROUP, format!("{cat}={DEFAULT_GROUP}, world={w}")) {
+                    return Some(f);
+                }
             }
         }
         if let Some(sg) = self.server_group(server) {
@@ -110,18 +168,55 @@ impl PropertyFile {
             if let Some(f) = try_at(node, name, format!("{cat}={name}, server={s}")) {
                 return Some(f);
             }
-            if let Some(f) = try_at(node, DEFAULT_GROUP, format!("{cat}={DEFAULT_GROUP}, server={s}")) {
-                return Some(f);
+            if !db_user {
+                if let Some(f) = try_at(node, DEFAULT_GROUP, format!("{cat}={DEFAULT_GROUP}, server={s}")) {
+                    return Some(f);
+                }
             }
         }
         if let Some(f) = try_at(&self.root, name, format!("{cat}={name}")) {
             return Some(f);
         }
+        if db_user {
+            return None;
+        }
         try_at(&self.root, DEFAULT_GROUP, format!("{cat}={DEFAULT_GROUP}"))
     }
 
-    /// Sets (or with None removes) a property of `name`, globally or for one world/server.
+    /// Sets (or with None removes) a property of `name`, globally or for one world/server. In a
+    /// database the change is queued as statements, which `save` writes.
     pub fn set(&mut self, name: &str, property: &str, value: Option<&str>, world: Option<&str>, server: Option<&str>) {
+        if self.db.is_some() {
+            let name = self.db_name(name);
+            self.set_tree(&name, property, value, world, server);
+            let stmts = mysql::set_statements(self.category, &name, property, value, world, server);
+            self.pending.extend(stmts);
+        } else {
+            self.set_tree(name, property, value, world, server);
+        }
+    }
+
+    /// Puts a row read from the database into the tree (no statement: it is already stored).
+    pub fn put_row(&mut self, row: &Row) {
+        let name = self.db_name(&row.name);
+        self.set_tree(&name, &row.property, row.value.as_deref(), row.world.as_deref(), row.server.as_deref());
+    }
+
+    /// `MySQLUserConfiguration.load`: a joining player's rows, by name and then by UUID, replace what
+    /// the tree holds for that player. Nothing happens for a file.
+    pub fn load_user_rows(&mut self, name: &str, uuid: &str) -> Result<(), String> {
+        let Some(db) = self.db.clone() else { return Ok(()) };
+        let mut rows = db.rows(&mysql::select_name(self.category, &name.to_lowercase()))?;
+        rows.extend(db.rows(&mysql::select_name(self.category, uuid))?);
+        self.remove_tree(name);
+        self.remove_tree(uuid);
+        for row in &rows {
+            self.put_row(row);
+        }
+        Ok(())
+    }
+
+    fn set_tree(&mut self, name: &str, property: &str, value: Option<&str>, world: Option<&str>, server: Option<&str>) {
         let section = if let Some(w) = world {
             self.root.section_mut("per-world").section_mut(w).section_mut(name)
         } else if let Some(s) = server {
@@ -146,8 +241,18 @@ impl PropertyFile {
         }
     }
 
-    /// Removes everything about `name`, also per world and per server.
+    /// Removes everything about `name`, also per world and per server (in a database, its rows too).
     pub fn remove_all(&mut self, name: &str) {
+        if self.db.is_some() {
+            let name = self.db_name(name);
+            self.remove_tree(&name);
+            self.pending.push(mysql::remove_statement(self.category, &name));
+        } else {
+            self.remove_tree(name);
+        }
+    }
+
+    fn remove_tree(&mut self, name: &str) {
         self.root.remove(name);
         for section in ["per-world", "per-server"] {
             if let Some(Yaml::Map(groups)) = self.root.get_mut(section) {
@@ -310,5 +415,61 @@ mod tests {
         assert_eq!(back.get("Alex", "tagprefix", None, None).unwrap().value, "&a");
         p.users.remove_all("Steve");
         assert!(p.users.get("Steve", "tabprefix", Some("nether"), None).is_none());
+    }
+
+    #[test]
+    fn database_scope_matches_names_exactly() {
+        let mut f = PropertyFile::from_str(
+            "per-world:\n  'world*':\n    Steve:\n      tabprefix: 'W '\n  world:\n    Steve:\n      tabprefix: 'exact '\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(f.get("Steve", "tabprefix", Some("world_nether"), None).unwrap().value, "W ");
+        f.exact_scope = true;
+        assert_eq!(f.get("Steve", "tabprefix", Some("world"), None).unwrap().value, "exact ");
+        assert!(f.get("Steve", "tabprefix", Some("world_nether"), None).is_none());
+    }
+
+    #[test]
+    fn database_users_have_no_default_entry() {
+        let mut f = PropertyFile::from_str("_DEFAULT_:\n  tabprefix: 'd '\n", "user").unwrap();
+        assert_eq!(f.get("Steve", "tabprefix", None, None).unwrap().value, "d ");
+        f.exact_scope = true;
+        assert!(f.get("Steve", "tabprefix", None, None).is_none());
+        // Groups keep `_DEFAULT_` in a database too.
+        f.category = "group";
+        assert_eq!(f.get("Steve", "tabprefix", None, None).unwrap().value, "d ");
+    }
+
+    #[test]
+    fn database_names_are_lower_case_except_default_group() {
+        let group = PropertyFile { category: "group", ..PropertyFile::default() };
+        assert_eq!(group.db_name("Admin"), "admin");
+        assert_eq!(group.db_name("_DEFAULT_"), "_DEFAULT_");
+        let user = PropertyFile { category: "user", ..PropertyFile::default() };
+        assert_eq!(user.db_name("Steve"), "steve");
+        assert_eq!(user.db_name("_DEFAULT_"), "_default_");
+    }
+
+    #[test]
+    fn rows_read_from_the_table_land_in_the_tree() {
+        let mut f = PropertyFile { category: "group", ..PropertyFile::default() };
+        f.put_row(&Row {
+            name: "Admin".into(),
+            property: "tabprefix".into(),
+            value: Some("&c".into()),
+            world: None,
+            server: None,
+        });
+        f.put_row(&Row {
+            name: "Admin".into(),
+            property: "tagprefix".into(),
+            value: Some("&4".into()),
+            world: Some("nether".into()),
+            server: None,
+        });
+        assert_eq!(f.get("admin", "tabprefix", None, None).unwrap().value, "&c");
+        assert_eq!(f.get("ADMIN", "tagprefix", Some("nether"), None).unwrap().value, "&4");
+        assert!(f.pending.is_empty());
     }
 }

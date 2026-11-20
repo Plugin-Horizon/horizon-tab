@@ -9,6 +9,8 @@ publish = false
 horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
 # Only crates in Horizon's Cargo.lock (a589a3dd9).
 serde_json = "1"
+# MySQL storage (`mysql.enabled`): the crate husksync and luckperms use (28.0.4 in perm-sdk's lock).
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 

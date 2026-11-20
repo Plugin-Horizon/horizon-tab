@@ -1,7 +1,6 @@
 //! `/tab` and the toggle commands. Sub-commands, arguments, permission nodes and messages follow
 //! TAB's `TabCommand` and its sub-commands (`command/` in the shared module) and `messages.yml`
-//! (Apache-2.0, see NOTICE). `cpu` and `dump` print no report/upload, and `mysql` always answers
-//! that MySQL is not enabled: those parts of TAB are not in this port.
+//! (Apache-2.0, see NOTICE). `cpu` and `dump` print no report/upload: those parts of TAB are not in this port.
 
 use crate::horizon_tab::engine::Engine;
 use crate::horizon_tab::integration;
@@ -355,8 +354,8 @@ fn dump(e: &mut Engine, a: &[String], o: &mut Output) {
     }
 }
 
-/// `MySQLCommand`: this port has no MySQL storage, so the answer after the permission check is
-/// TAB's "not enabled".
+/// `MySQLCommand`: `upload` and `download` after the permission check. Without a database connection
+/// (`mysql.enabled` off, or the connection failed) TAB's "not enabled" answer.
 fn mysql(e: &mut Engine, sender: Sender, a: &[String], o: &mut Output) {
     let help = |e: &Engine, o: &mut Output| {
         o.say(e.message(
@@ -367,20 +366,37 @@ fn mysql(e: &mut Engine, sender: Sender, a: &[String], o: &mut Output) {
     let Some(first) = a.first() else {
         return help(e, o);
     };
-    let node = if first.eq_ignore_ascii_case("download") {
-        "tab.mysql.download"
+    let (node, upload) = if first.eq_ignore_ascii_case("download") {
+        ("tab.mysql.download", false)
     } else if first.eq_ignore_ascii_case("upload") {
-        "tab.mysql.upload"
+        ("tab.mysql.upload", true)
     } else {
         return help(e, o);
     };
-    if has(sender, node) {
-        o.say(e.message(
+    if !has(sender, node) {
+        return no_permission(e, o);
+    }
+    if e.props.groups.db.is_none() {
+        return o.say(e.message(
             "mysql-fail-not-enabled",
             "&cCannot download/upload data from/to MySQL, because it's disabled.",
         ));
+    }
+    let result = if upload {
+        crate::horizon_tab::mysql::upload(&e.dir, &mut e.props)
     } else {
-        no_permission(e, o);
+        crate::horizon_tab::mysql::download(&e.dir, &e.props)
+    };
+    match result {
+        Ok(()) if upload => o.say(e.message("mysql-upload-success", "&aMySQL data uploaded successfully.")),
+        Ok(()) => o.say(e.message("mysql-download-success", "&aMySQL data downloaded successfully.")),
+        Err(err) => {
+            eprintln!("[tab] MySQL {} failed: {err}", if upload { "upload" } else { "download" });
+            o.say(e.message(
+                "mysql-fail-error",
+                "MySQL download / upload failed due to an error. Check console for more info.",
+            ));
+        }
     }
 }
 
@@ -1044,6 +1060,14 @@ mod tests {
             vec![p],
         );
         e
+    }
+
+    #[test]
+    fn mysql_without_a_database_says_not_enabled() {
+        let mut e = engine();
+        let not_enabled = vec!["&cCannot download/upload data from/to MySQL, because it's disabled."];
+        assert_eq!(tab(&mut e, Sender::Console, "mysql upload").replies, not_enabled);
+        assert_eq!(tab(&mut e, Sender::Console, "mysql download").replies, not_enabled);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::horizon_tab::yaml::Yaml;
 use mysql::prelude::Queryable;
 use mysql::{OptsBuilder, Params, Pool, SslOpts, Value};
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 /// The `mysql` section, read as `MySQLConfiguration.fromSection` reads it. The defaults are TAB's
@@ -320,6 +321,66 @@ pub fn attach(cfg: &MysqlConfig, props: &mut Properties, warnings: &mut Vec<Stri
     }
     props.groups = groups;
     props.users = PropertyFile::database("user", db);
+}
+
+/// TAB's own `groups.yml` and `users.yml`: copied in when a file is missing, as TAB does.
+const DEFAULT_GROUPS: &str = include_str!("../../data/tab/defaults/groups.yml");
+const DEFAULT_USERS: &str = include_str!("../../data/tab/defaults/users.yml");
+
+/// A YAML file, or TAB's default text when the file is missing (`YamlPropertyConfigurationFile`).
+fn file_or_default(path: &Path, category: &'static str, default: &str) -> Result<PropertyFile, String> {
+    if path.exists() {
+        PropertyFile::load(path, category)
+    } else {
+        let mut file = PropertyFile::from_str(default, category)?;
+        file.path = Some(path.to_owned());
+        Ok(file)
+    }
+}
+
+/// `/tab mysql download`: the rows of both tables are written into `groups.yml` and `users.yml`,
+/// on top of what those files hold. The running configuration is not changed (as TAB).
+pub fn download(dir: &Path, props: &Properties) -> Result<(), String> {
+    let db = props.groups.db.clone().ok_or("MySQL is not enabled")?;
+    let group_rows = db.rows(&select_all("group"))?;
+    let user_rows = db.rows(&select_all("user"))?;
+    let mut groups = file_or_default(&dir.join("groups.yml"), "group", DEFAULT_GROUPS)?;
+    for row in &group_rows {
+        groups.set(&row.name, &row.property, row.value.as_deref(), row.world.as_deref(), row.server.as_deref());
+    }
+    groups.save()?;
+    let mut users = file_or_default(&dir.join("users.yml"), "user", DEFAULT_USERS)?;
+    for row in &user_rows {
+        users.set(&row.name, &row.property, row.value.as_deref(), row.world.as_deref(), row.server.as_deref());
+    }
+    users.save()
+}
+
+/// `/tab mysql upload`: both tables are emptied, then the rows of `groups.yml` and `users.yml` are
+/// written, and the running configuration takes them too. A failure drops the statements still queued.
+pub fn upload(dir: &Path, props: &mut Properties) -> Result<(), String> {
+    let result = upload_rows(dir, props);
+    if result.is_err() {
+        props.groups.pending.clear();
+        props.users.pending.clear();
+    }
+    result
+}
+
+fn upload_rows(dir: &Path, props: &mut Properties) -> Result<(), String> {
+    let db = props.groups.db.clone().ok_or("MySQL is not enabled")?;
+    let groups = file_or_default(&dir.join("groups.yml"), "group", DEFAULT_GROUPS)?;
+    let users = file_or_default(&dir.join("users.yml"), "user", DEFAULT_USERS)?;
+    db.exec(&delete_all("group"))?;
+    db.exec(&delete_all("user"))?;
+    for row in rows_of(&groups) {
+        props.groups.set(&row.name, &row.property, row.value.as_deref(), row.world.as_deref(), row.server.as_deref());
+    }
+    props.groups.save()?;
+    for row in rows_of(&users) {
+        props.users.set(&row.name, &row.property, row.value.as_deref(), row.world.as_deref(), row.server.as_deref());
+    }
+    props.users.save()
 }
 
 #[cfg(test)]

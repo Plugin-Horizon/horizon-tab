@@ -454,6 +454,9 @@ impl Engine {
             let bedrock = integration::first(|i| i.is_bedrock(input.uuid)).unwrap_or(false);
             let vanished = input.vanished || integration::first(|i| i.is_vanished(input.uuid)).unwrap_or(false);
             let existing = self.players.iter().position(|p| p.tp.p.uuid == input.uuid);
+            if existing.is_none() {
+                self.load_mysql_user(&input.name, input.uuid);
+            }
             let joined_ms = existing.map(|i| self.players[i].joined_ms).unwrap_or(self.now_ms);
             let tp = TabPlayer {
                 p: Player {
@@ -1298,15 +1301,31 @@ impl Engine {
         out
     }
 
-    /// Reloads the files, keeping the online players and their toggles.
+    /// Reloads the files (or the database), keeping the online players and their toggles.
     pub fn reload(&mut self) -> Vec<Packet> {
         let out = self.unload();
         let mut fresh = Engine::load(&self.dir);
         fresh.players = std::mem::take(&mut self.players);
         fresh.now_ms = self.now_ms;
         fresh.server = self.server.clone();
+        let online: Vec<(String, u128)> = fresh
+            .players
+            .iter()
+            .map(|p| (p.tp.p.name.clone(), p.tp.p.uuid))
+            .collect();
+        for (name, uuid) in &online {
+            fresh.load_mysql_user(name, *uuid);
+        }
         *self = fresh;
         out
+    }
+
+    /// `MySQLUserConfiguration.load`: a player's rows, read on join (and after a reload for the
+    /// players online). Nothing happens while the users are in a file.
+    fn load_mysql_user(&mut self, name: &str, uuid: u128) {
+        if let Err(e) = self.props.users.load_user_rows(name, &uuid_string(uuid)) {
+            eprintln!("[tab] Failed to execute MySQL query due to error: {e}");
+        }
     }
 
     // ---- what commands change ------------------------------------------------------------

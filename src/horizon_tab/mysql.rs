@@ -87,9 +87,9 @@ pub fn table_of(category: &str) -> (&'static str, &'static str) {
 
 /// Reads every row of the category's table.
 pub fn select_all(category: &str) -> Stmt {
-    let (table, _) = table_of(category);
+    let (table, column) = table_of(category);
     Stmt {
-        sql: format!("SELECT `group`, `property`, `value`, `world`, `server` FROM `{table}`"),
+        sql: format!("SELECT `{column}`, `property`, `value`, `world`, `server` FROM `{table}`"),
         params: Vec::new(),
     }
 }
@@ -387,6 +387,10 @@ mod tests {
         assert_eq!(
             select_all("group"),
             stmt("SELECT `group`, `property`, `value`, `world`, `server` FROM `tab_groups`", &[])
+        );
+        assert_eq!(
+            select_all("user"),
+            stmt("SELECT `user`, `property`, `value`, `world`, `server` FROM `tab_users`", &[])
         );
         assert_eq!(
             select_name("user", "steve"),

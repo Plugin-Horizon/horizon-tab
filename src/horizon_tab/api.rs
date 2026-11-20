@@ -287,6 +287,26 @@ fn literal_word(name: &str) -> bool {
 }
 
 /// The commands to register: (usage, operator level). Permission nodes are checked when run.
+/// Whether the word being typed after `/<root>` is a `player_name` slot of one of `usages` (the TAB usage strings).
+/// `args` are the words typed after the root, the last one being the word in progress. The words before it must
+/// match a usage (a `<...>` slot takes any word); the slot itself must be a `<name:player_name>` one.
+pub fn player_name_expected(usages: &[String], root: &str, args: &[&str]) -> bool {
+    let Some(current) = args.len().checked_sub(1) else {
+        return false;
+    };
+    usages.iter().any(|usage| {
+        let tokens: Vec<&str> = usage.split_whitespace().collect();
+        if tokens.first().is_none_or(|t| !t.eq_ignore_ascii_case(root)) || tokens.len() <= current + 1 {
+            return false;
+        }
+        let before_match = args[..current].iter().enumerate().all(|(i, word)| {
+            let token = tokens[i + 1];
+            token.starts_with('<') || token.eq_ignore_ascii_case(word)
+        });
+        before_match && tokens[current + 1].starts_with('<') && tokens[current + 1].ends_with(":player_name>")
+    })
+}
+
 /// One usage per sub-command path with typed arguments, so the client completes the words and the
 /// fixed choices itself. The `text` catch-all comes last: free text and unknown words still reach
 /// `/tab`'s own help and messages. Every usage dispatches to the same `commands::tab` code.
@@ -580,5 +600,40 @@ mod tests {
         assert_eq!(std::fs::read_to_string(plugin.join("config.yml")).unwrap(), "debug: false\n");
         assert!(!config.join("tab").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod player_name_completion_tests {
+    use super::player_name_expected;
+
+    fn usages() -> Vec<String> {
+        [
+            "tab reload",
+            "tab dump <player:player>",
+            "tab player <name:player_name>",
+            "tab player <name:player_name> remove",
+            "tab player <name:player_name> tabprefix [value:text]",
+            "tab group <name:word>",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+    }
+
+    #[test]
+    fn name_slot_after_a_literal_word() {
+        assert!(player_name_expected(&usages(), "tab", &["player", ""]));
+        assert!(player_name_expected(&usages(), "tab", &["player", "Ste"]));
+    }
+
+    #[test]
+    fn no_name_slot_for_other_words_or_roots() {
+        assert!(!player_name_expected(&usages(), "tab", &["group", ""]));
+        assert!(!player_name_expected(&usages(), "tab", &["dump", ""]));
+        assert!(!player_name_expected(&usages(), "tab", &["player", "Steve", ""]));
+        assert!(!player_name_expected(&usages(), "bossbar", &["player", ""]));
+        assert!(!player_name_expected(&usages(), "tab", &[""]));
+        assert!(!player_name_expected(&usages(), "tab", &[]));
     }
 }

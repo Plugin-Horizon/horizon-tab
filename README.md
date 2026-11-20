@@ -85,7 +85,7 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 - With the Cargo feature `horizon_main_api` (needs a Horizon build that has the calls of main and PR #17980; off by default) ping, nickname, vanished, the sidebar, list names (the player's own view) and team colours and members work; the rest of this list stays.
 - Scoreboard teams are not shown at all (no name tag prefix/suffix or colour, no team sorting); the sidebar and the tab-list and below-name objective slots are dropped; ping and game mode are not sent.
 - The anti-override guard is off (outgoing packets cannot be watched), so other senders' team, latency or name packets are not put back.
-- `%player-version%` is wrong (no protocol read); name completion falls back to plain words.
+- `%player-version%` is wrong (no protocol read). Player-name arguments of `/tab` complete online names; an offline name is still accepted as typed.
 - A toggle named like a vanilla command (`/bossbar`) is only reachable as `/tab bossbar`.
 - List names are per player, not per viewer.
 

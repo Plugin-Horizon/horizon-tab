@@ -1,5 +1,5 @@
 # hmod port: tab
-Parity: before 35% -> after 35% default build / ~42% with feature `horizon_main_api` (~40/115 -> ~48/115 items; method: commands+sub-commands, permission nodes, config keys, message keys and listed features counted against TAB 6.2.2-SNAPSHOT; the feature items count only once the pinned SDK is moved to a main that has the calls).
+Parity: before 35% -> after 36% default build / ~43% with feature `horizon_main_api` (~40/115 -> ~41/115 items; ~48/115 -> ~49/115 with the feature; method: commands+sub-commands, permission nodes, config keys, message keys and listed features counted against TAB 6.2.2-SNAPSHOT; the feature items count only once the pinned SDK is moved to a main that has the calls)
 
 Round 2 (FIX2)
 - New Cargo feature `horizon_main_api` (off by default). The pinned SDK (perm-sdk) has none of the following calls; they exist on Horizon main / PR #17980 and are coded behind the feature in `src/lib.rs`. Written blind from the merged signatures and the paper ledger; neither the feature code nor the default-build edits (sidebar_rows, its tests, cfg stubs) were compiled (owner order 2026-11-20).
@@ -24,3 +24,15 @@ Round 1
   - `tab.spectatorbypass` default level 4: the old code asked with fallback 0 (nobody); no level denies everyone.
   - Assumed `permission_gather_nodes` runs before the first permission query.
   - `vanished` is always false; `ping` is always 0.
+
+Round 3 (blind, not compiled)
+- `/tab <player|playeruuid|group> <name> ...` and the other `<name:player_name>` slots of `/tab` complete ONLINE player names
+  (`tab_complete` in `src/lib.rs`, the slot test `api::player_name_expected`, unit tests in `src/horizon_tab/api.rs`). The
+  registered usage still takes a word, so an offline name is accepted as before. Names are not offered for `group` (a word).
+- Not done, and why (all need host APIs, see GAPS_UPSTREAM `tab:` lines): `layout` (per-viewer fake list entries), global and
+  per-world playerlist (per-viewer tab list removal), `%online_<server>%` for other servers (proxy bridge), `nametag opaque`
+  (per-viewer entity data and team options; still answers that it is not part of this port), `%player-version%`.
+- Not done: `mysql` storage. It needs a database-backed user and group source in place of `users.yml`/`groups.yml` (TAB's
+  `MySQLUserConfiguration`/`MySQLGroupConfiguration`) and the upload/download commands; the port's config is file-only, and
+  the work was too large to write blind. `/tab mysql` stays the message-only answer (`mysql-fail-not-enabled`). The `mysql`
+  crate is already used by husksync, so a later round can build on it.

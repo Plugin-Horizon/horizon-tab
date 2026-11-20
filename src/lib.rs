@@ -25,7 +25,8 @@ use mod_api::{
     LoopContext, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
     PermissionValueType, PlayerRef, PlayerRespawnedEvent, PlayerTabListNameFormatEvent,
     RegisterCommandsEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
-    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StatType, Text,
+    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StatType, Suggestion, TabCompleteEvent,
+    Text,
 };
 use crate::horizon_tab::out::{NumberFmt, ObjectiveMethod};
 // Calls that exist on Horizon main only (feature `horizon_main_api`, off by default; see HMOD_PORT.md).
@@ -625,10 +626,34 @@ impl Hooks for Mod {
         log("Not shown yet: scoreboard teams (name tags, sorting), sidebar, below-name and list objectives, ping and game mode.");
     }
 
+    /// Online names for a `<name:player_name>` slot of `/tab` (the registered usage is a word, which takes
+    /// offline names too; `api::player_name_expected` finds the slot).
+    fn tab_complete(&self, host: &mut dyn ServerHost, event: &mut TabCompleteEvent<'_>) {
+        let line = event.command.trim_start_matches('/');
+        let mut words: Vec<&str> = line.split(' ').collect();
+        let root = words.remove(0);
+        if !root.eq_ignore_ascii_case("tab") || words.is_empty() {
+            return;
+        }
+        let usages: Vec<String> = api::commands().into_iter().map(|(usage, _)| usage).collect();
+        if !api::player_name_expected(&usages, root, &words) {
+            return;
+        }
+        let typed = words.last().copied().unwrap_or("").to_lowercase();
+        let [start, end] = event.range;
+        for player in host.players().server_players() {
+            let Some(name) = player.name(&*host) else {
+                continue;
+            };
+            if name.to_lowercase().starts_with(&typed) && !event.suggestions.iter().any(|s| s.text == name) {
+                event.suggestions.push(Suggestion::new((start, end), name));
+            }
+        }
+    }
+
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         for (usage, level) in api::commands() {
-            // A word takes any name (an offline one too), so the usages carry no name completion.
-            // TODO(arismoko-api: player_name argument kind): no name completion meanwhile.
+            // A word takes any name (an offline one too); `tab_complete` suggests the online names.
             let usage = usage.replace(":player_name>", ":word>");
             event.commands.push(if level == 0 {
                 Command::new(&usage)

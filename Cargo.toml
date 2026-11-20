@@ -11,3 +11,8 @@ horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+
+[features]
+# Calls that exist on Horizon main only (player latency/nickname/hidden reads, per-player sidebar, tab list
+# name, scoreboard teams, send packet). Off by default: the pinned SDK does not have them.
+horizon_main_api = []

@@ -28,6 +28,11 @@ use mod_api::{
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StatType, Text,
 };
 use crate::horizon_tab::out::{NumberFmt, ObjectiveMethod};
+// Calls that exist on Horizon main only (feature `horizon_main_api`, off by default; see HMOD_PORT.md).
+#[cfg(feature = "horizon_main_api")]
+use mod_api::{
+    ClientboundPlayPacket, Identifier, ScoreHolder, Sidebar, SidebarLine, TeamColor,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -131,6 +136,34 @@ fn text_of(value: &Value) -> Text {
     text
 }
 
+// `player_latency`, `player_nickname` and `player_hidden` (#17878) exist on Horizon main only. The
+// pinned SDK has no read, so without the feature `%ping%` is 0, no nickname is read and nobody is vanished.
+#[cfg(feature = "horizon_main_api")]
+fn ping_of(host: &dyn ServerHost, player: PlayerRef) -> i32 {
+    player.latency(host).unwrap_or(0)
+}
+#[cfg(not(feature = "horizon_main_api"))]
+fn ping_of(_: &dyn ServerHost, _: PlayerRef) -> i32 {
+    0
+}
+#[cfg(feature = "horizon_main_api")]
+fn nickname_of(host: &dyn ServerHost, player: PlayerRef) -> Option<String> {
+    player.nickname(host).flatten()
+}
+#[cfg(not(feature = "horizon_main_api"))]
+fn nickname_of(_: &dyn ServerHost, _: PlayerRef) -> Option<String> {
+    None
+}
+/// `player_hide` hides a player from everyone below a permission level; any level reads as vanished.
+#[cfg(feature = "horizon_main_api")]
+fn vanished_of(host: &dyn ServerHost, player: PlayerRef) -> bool {
+    player.hidden(host).flatten().is_some()
+}
+#[cfg(not(feature = "horizon_main_api"))]
+fn vanished_of(_: &dyn ServerHost, _: PlayerRef) -> bool {
+    false
+}
+
 /// The player as the TAB core reads them each tick.
 fn player_in(host: &dyn ServerHost, player: PlayerRef) -> PlayerIn {
     let entity = player.entity();
@@ -152,12 +185,9 @@ fn player_in(host: &dyn ServerHost, player: PlayerRef) -> PlayerIn {
         health,
         game_mode: player.game_mode(host).map(|mode| mode.id()).unwrap_or(0),
         op_level: player.permission_level(host).unwrap_or(0),
-        // HMOD-GAP(player_latency): Horizon main has no read of a player's latency; `%ping%` is 0.
-        ping: 0,
-        // HMOD-GAP(player_nickname_read): Horizon main has a nickname setter only; no nickname is read.
-        nickname: None,
-        // HMOD-GAP(player_hidden_read): `player_hide` is a setter only; nobody is read as vanished.
-        vanished: false,
+        ping: ping_of(host, player),
+        nickname: nickname_of(host, player),
+        vanished: vanished_of(host, player),
         invisible: entity.is_invisible(host).unwrap_or(false),
         deaths: player
             .stat(host, StatType::Custom, "minecraft:deaths")
@@ -197,8 +227,18 @@ fn player_info_body(action: u8, entries: &[(u128, i32)]) -> Vec<u8> {
 // HMOD-GAP(player_send_packet): Horizon main has no server-side call that sends a clientbound play
 // packet to one player (only the client's `send_packet`). Latency and game mode per viewer are not
 // sent; the bodies are still built by `player_info_body`.
+#[cfg(not(feature = "horizon_main_api"))]
 fn send_player_info(host: &mut dyn ServerHost, viewer: u128, action: u8, entries: &[(u128, i32)]) {
     let _ = (host, viewer, player_info_body(action, entries));
+}
+
+/// `player_send_packet` of Horizon main sends the packet to that player as it is.
+#[cfg(feature = "horizon_main_api")]
+fn send_player_info(host: &mut dyn ServerHost, viewer: u128, action: u8, entries: &[(u128, i32)]) {
+    let Some(player) = host.player(viewer) else { return };
+    let Ok(id) = Identifier::parse("minecraft:player_info_update") else { return };
+    let packet = ClientboundPlayPacket::new(id, player_info_body(action, entries));
+    let _ = host.player_send_packet(player, packet);
 }
 
 /// The permission answer for a Boolean node, asked of the game as a typed query. Any refusal
@@ -234,13 +274,10 @@ fn send(host: &mut dyn ServerHost, packets: Vec<Packet>) {
             // TODO(arismoko-api: watch_server_packets): the anti-override guard (`guard_packet`)
             // is not wired: other senders' team, latency, game mode and name packets are not
             // put back.
-            Out::DisplayNames(entries) => display_names(host, entries),
+            Out::DisplayNames(entries) => display_names(host, to, entries),
             Out::TeamCreate { name, params, players } => team(host, &name, params.color, Some(players)),
             Out::TeamUpdate { name, params } => team(host, &name, params.color, None),
-            // HMOD-GAP(team_remove): see `team`; there are no scoreboard teams to remove.
-            Out::TeamRemove { name } => {
-                let _ = name;
-            }
+            Out::TeamRemove { name } => team_remove(host, &name),
             out @ (Out::Objective { .. } | Out::DisplaySlot { .. } | Out::Score { .. } | Out::ResetScore { .. }) => {
                 if state().views.entry(to).or_default().apply(out) {
                     changed.insert(to);
@@ -325,12 +362,59 @@ impl View {
     }
 }
 
-/// The viewer's sidebar from their objectives: lines by score, highest first (as vanilla sorts),
-/// the line's text its display (else the owner), the right side its number format (else the score).
-// HMOD-GAP(set_sidebar): Horizon main has no sidebar objective API, so the sidebar is not shown.
-// The objectives and scores are still kept by `View::apply`; nothing is drawn from them.
+impl View {
+    /// The sidebar objective's title and rows (text, right-hand value), as vanilla orders them:
+    /// highest score first, equal scores by name, at most 15. The text is the line's display (else
+    /// its owner); the right side is the number format's text, nothing for `blank`, else the score.
+    #[cfg_attr(not(feature = "horizon_main_api"), allow(dead_code))]
+    fn sidebar_rows(&self) -> Option<(Value, Vec<(Value, Option<Value>)>)> {
+        let name = self.sidebar.as_ref()?;
+        let title = self.titles.get(name)?.clone();
+        let mut rows: Vec<(&String, &(i32, Option<Value>, Option<NumberFmt>))> =
+            self.scores.get(name).into_iter().flatten().collect();
+        rows.sort_by(|a, b| {
+            b.1.0.cmp(&a.1.0).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        });
+        let rows = rows
+            .into_iter()
+            .take(15)
+            .map(|(owner, (score, display, format))| {
+                let text = display.clone().unwrap_or_else(|| Value::String(owner.clone()));
+                let value = match format {
+                    Some(NumberFmt::Blank) => None,
+                    Some(NumberFmt::Fixed(v)) => Some(v.clone()),
+                    None => Some(Value::String(score.to_string())),
+                };
+                (text, value)
+            })
+            .collect();
+        Some((title, rows))
+    }
+}
+
+/// The viewer's sidebar from their objectives (`player_set_sidebar`).
+// HMOD-GAP(set_sidebar): the pinned SDK has no sidebar call; the objectives are still kept by
+// `View::apply`. With `horizon_main_api` the sidebar of Horizon main (#17948) shows them.
+#[cfg(not(feature = "horizon_main_api"))]
 fn sidebar(host: &mut dyn ServerHost, viewer: u128) {
     let _ = (host, viewer);
+}
+
+#[cfg(feature = "horizon_main_api")]
+fn sidebar(host: &mut dyn ServerHost, viewer: u128) {
+    let Some(player) = host.player(viewer) else { return };
+    let rows = state().views.get(&viewer).and_then(View::sidebar_rows);
+    let shown = rows.map(|(title, rows)| {
+        let lines = rows
+            .iter()
+            .map(|(text, value)| {
+                let value = value.as_ref().map(|v| text_json(&*host, v));
+                SidebarLine::new(text_json(&*host, text), value)
+            })
+            .collect();
+        Sidebar::new(text_json(&*host, &title), lines)
+    });
+    let _ = player.set_sidebar(host, shown);
 }
 
 /// `TeamColor` index (0..15) to the chat colour name `team_set` takes.
@@ -339,19 +423,101 @@ const COLORS: [&str; 16] = [
     "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white",
 ];
 
+#[cfg(feature = "horizon_main_api")]
+fn team_color(index: i32) -> Option<TeamColor> {
+    Some(match index {
+        0 => TeamColor::Black,
+        1 => TeamColor::DarkBlue,
+        2 => TeamColor::DarkGreen,
+        3 => TeamColor::DarkAqua,
+        4 => TeamColor::DarkRed,
+        5 => TeamColor::DarkPurple,
+        6 => TeamColor::Gold,
+        7 => TeamColor::Gray,
+        8 => TeamColor::DarkGray,
+        9 => TeamColor::Blue,
+        10 => TeamColor::Green,
+        11 => TeamColor::Aqua,
+        12 => TeamColor::Red,
+        13 => TeamColor::LightPurple,
+        14 => TeamColor::Yellow,
+        15 => TeamColor::White,
+        _ => return None,
+    })
+}
+
 /// A TAB team (name tags and sorting) as a team of the world's scoreboard.
-// HMOD-GAP(team_set/team_join): Horizon main has no scoreboard teams, so TAB's teams (name tag
-// colours and team sorting) are not set. The core's team packets are dropped here.
+// HMOD-GAP(team_prefix_suffix): the pinned SDK has no scoreboard team calls at all, so the core's
+// team packets are dropped. With `horizon_main_api` (the teams of PR #17980) a team takes its
+// colour and members only: no prefix, suffix, name tag visibility, collision or friendly fire.
+#[cfg(not(feature = "horizon_main_api"))]
 fn team(host: &mut dyn ServerHost, name: &str, color: Option<i32>, players: Option<Vec<String>>) {
     let _ = (host, name, color, players, COLORS);
 }
 
-/// TAB's tab list names. The core sends them per viewer; `set_list_name` is the same for everyone,
-/// so a name is set when it differs from the last one set (TODO(arismoko-api: per-viewer list names)).
-// HMOD-GAP(set_list_name): Horizon main has no tab list name setter, so the core's per-viewer
-// names are not sent. The tab list name hook (`player_tab_list_name_format`) still sets names.
-fn display_names(host: &mut dyn ServerHost, entries: Vec<(u128, Option<Value>)>) {
-    let _ = (host, entries);
+#[cfg(feature = "horizon_main_api")]
+fn team(host: &mut dyn ServerHost, name: &str, color: Option<i32>, players: Option<Vec<String>>) {
+    let handle = match host.team(name) {
+        Some(handle) => handle,
+        None => match host.add_team(name) {
+            Ok(handle) => handle,
+            Err(_) => return,
+        },
+    };
+    let mut st = state();
+    // The core sends each viewer the same team, so only a change is applied.
+    if st.teams.get(name) != Some(&color) {
+        let _ = host.team_set_color(handle.clone(), color.and_then(team_color));
+        st.teams.insert(name.to_owned(), color);
+    }
+    for player in players.into_iter().flatten() {
+        if st.members.get(&player).map(String::as_str) != Some(name) {
+            let _ = host.team_join(handle.clone(), ScoreHolder::Name(player.clone()));
+            st.members.insert(player, name.to_owned());
+        }
+    }
+}
+
+#[cfg(not(feature = "horizon_main_api"))]
+fn team_remove(host: &mut dyn ServerHost, name: &str) {
+    let _ = (host, name);
+}
+
+#[cfg(feature = "horizon_main_api")]
+fn team_remove(host: &mut dyn ServerHost, name: &str) {
+    if let Some(handle) = host.team(name) {
+        let _ = host.team_remove(handle);
+    }
+    let mut st = state();
+    st.teams.remove(name);
+    st.members.retain(|_, team| team != name);
+}
+
+/// TAB's tab list names. The core sends them per viewer, `player_set_list_name` is the same for
+/// everyone, so only the name a player's own view gets is set (and only when it changed).
+// HMOD-GAP(set_list_name): the pinned SDK has no tab list name setter, so the core's names are not
+// sent; the `player_tab_list_name_format` hook still sets one name per player.
+#[cfg(not(feature = "horizon_main_api"))]
+fn display_names(host: &mut dyn ServerHost, viewer: u128, entries: Vec<(u128, Option<Value>)>) {
+    let _ = (host, viewer, entries);
+}
+
+#[cfg(feature = "horizon_main_api")]
+fn display_names(host: &mut dyn ServerHost, viewer: u128, entries: Vec<(u128, Option<Value>)>) {
+    for (uuid, name) in entries {
+        if uuid != viewer {
+            continue;
+        }
+        let key = name.as_ref().map(Value::to_string);
+        if state().list_names.get(&uuid) == Some(&key) {
+            continue;
+        }
+        let text = name.as_ref().map(|json| text_json(&*host, json));
+        if let Some(player) = host.player(uuid) {
+            let _ = player.set_list_name(host, text);
+        }
+        state().list_names.insert(uuid, key);
+    }
 }
 
 fn color_of(index: i32) -> Option<BossBarColor> {
@@ -453,6 +619,9 @@ impl Hooks for Mod {
             log(&line);
         }
         log("ported: tab list header/footer, one list name per player, boss bars, chat, commands and placeholders.");
+        #[cfg(feature = "horizon_main_api")]
+        log("Shown: sidebar, list names, team colours, ping and game mode. Not shown: team prefixes/suffixes, below-name and list objectives.");
+        #[cfg(not(feature = "horizon_main_api"))]
         log("Not shown yet: scoreboard teams (name tags, sorting), sidebar, below-name and list objectives, ping and game mode.");
     }
 
@@ -602,5 +771,65 @@ impl Hooks for Mod {
     fn server_stopping(&self, host: &mut dyn ServerHost, _: &mut ServerStoppingEvent) {
         let packets = api::stop();
         send(host, packets);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sidebar_rows_sort_by_score_then_name_and_apply_formats() {
+        let mut view = View::default();
+        view.apply(Out::Objective {
+            name: "sb".into(),
+            method: ObjectiveMethod::Add,
+            title: json!("Title"),
+            hearts: false,
+            format: None,
+        });
+        view.apply(Out::DisplaySlot { slot: 1, objective: "sb".into() });
+        for (owner, score, display, format) in [
+            ("b", 3, None, None),
+            ("a", 3, Some(json!("Shown")), Some(NumberFmt::Fixed(json!("x")))),
+            ("c", 9, None, Some(NumberFmt::Blank)),
+        ] {
+            view.apply(Out::Score { owner: owner.into(), objective: "sb".into(), score, display, format });
+        }
+        let (title, rows) = view.sidebar_rows().unwrap();
+        assert_eq!(title, json!("Title"));
+        assert_eq!(
+            rows,
+            vec![
+                (json!("c"), None),
+                (json!("Shown"), Some(json!("x"))),
+                (json!("b"), Some(json!("3"))),
+            ]
+        );
+    }
+
+    #[test]
+    fn sidebar_rows_are_none_without_a_sidebar_and_capped_at_15() {
+        let mut view = View::default();
+        assert!(view.sidebar_rows().is_none());
+        view.apply(Out::Objective {
+            name: "sb".into(),
+            method: ObjectiveMethod::Add,
+            title: json!("T"),
+            hearts: false,
+            format: None,
+        });
+        view.apply(Out::DisplaySlot { slot: 1, objective: "sb".into() });
+        for i in 0..20 {
+            view.apply(Out::Score {
+                owner: format!("o{i:02}"),
+                objective: "sb".into(),
+                score: i,
+                display: None,
+                format: None,
+            });
+        }
+        assert_eq!(view.sidebar_rows().unwrap().1.len(), 15);
     }
 }

@@ -1,4 +1,15 @@
 # hmod port: tab
+Parity: before 35% -> after 35% default build / ~42% with feature `horizon_main_api` (~40/115 -> ~48/115 items; method: commands+sub-commands, permission nodes, config keys, message keys and listed features counted against TAB 6.2.2-SNAPSHOT; the feature items count only once the pinned SDK is moved to a main that has the calls).
+
+Round 2 (FIX2)
+- New Cargo feature `horizon_main_api` (off by default). The pinned SDK (perm-sdk) has none of the following calls; they exist on Horizon main / PR #17980 and are coded behind the feature in `src/lib.rs`. Written blind from the merged signatures and the paper ledger; neither the feature code nor the default-build edits (sidebar_rows, its tests, cfg stubs) were compiled (owner order 2026-11-20).
+  - `player.latency(host)` -> `%ping%` (#17878); `player.nickname(host)`; `player.hidden(host)` -> `%vanished%` / `%online%` (#17878).
+  - `player.set_sidebar(host, Some(Sidebar))` (#17948): TAB's sidebar scoreboards, built from the core's objective packets by `View::sidebar_rows` (vanilla order: score desc, name, max 15; unit-tested, also in the default build).
+  - `player.set_list_name(host, Option<Text>)` (#17884): the name the player's OWN view receives (list names are per player, not per viewer); the `player_tab_list_name_format` hook keeps the last word.
+  - Scoreboard teams (`host.team/add_team/team_set_color/team_join/team_leave/team_remove`, PR #17980, branch tab-teams): team colour and members only; the team API has no prefix, suffix, name tag visibility, collision or friendly fire.
+  - `host.player_send_packet` (main): per-viewer latency and game mode (`minecraft:player_info_update`).
+- Not closable even with the feature: team prefix/suffix/visibility/collision (needs `set_player_team` packet body or team setters), list and below-name objectives (no slot API), per-viewer list names, `%player-version%` (no protocol read), anti-override guard (no packet watch), `nametag opaque`, layout, global/per-world playerlist, mysql, proxy bridge.
+
 Round 1
 - Fixed: src/lib.rs imports: removed `ClientboundPlayPacket`, `Identifier`, `Sidebar`, `SidebarLine` (no such API); added typed permission imports (13 errors).
 - Fixed: src/lib.rs `player_in`: `ping`, `nickname`, `vanished` read values replaced by `0`, `None`, `false` (no getters on main).

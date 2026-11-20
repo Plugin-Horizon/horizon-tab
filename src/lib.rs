@@ -7,25 +7,36 @@
 //! (host boss bar calls, one bar per viewer), the tab list name (`player_tab_list_name_format`),
 //! the tick (`server_tick`), respawns and the stop.
 //!
-//! Packets: latency and game mode per viewer go out through `player_send_packet`. Permission
-//! nodes are asked of the game (`player_permission_value`) each tick, for the nodes the core asked
-//! about. Not ported yet: teams (name tags), objectives (tab list ping and health, below name,
-//! sidebar), scores, per-viewer display names (their bodies need NBT text components), the packet
-//! guard, and the LuckPerms bridge (its placeholders and prefixes).
+//! Packets: latency and game mode per viewer were to go out through `player_send_packet`, which
+//! Horizon main lacks (HMOD-GAP). Permission nodes are declared once (`permission_gather_nodes`)
+//! and asked of the game as typed Boolean queries each tick. Not ported: teams (name tags),
+//! objectives (tab list ping and health, below name, sidebar), scores, per-viewer display names,
+//! the packet guard, and the LuckPerms bridge (its placeholders and prefixes).
 
-use horizon_tab::api;
-use horizon_tab::engine::PlayerIn;
-use horizon_tab::out::{BossOut, Out, Packet};
-use horizon_tab::placeholders::Server;
+
+pub mod horizon_tab;
+use crate::horizon_tab::api;
+use crate::horizon_tab::engine::PlayerIn;
+use crate::horizon_tab::out::{BossOut, Out, Packet};
+use crate::horizon_tab::placeholders::Server;
 use mod_api::serde_json::Value;
 use mod_api::{
-    BossBarColor, BossBarOverlay, ClientboundPlayPacket, Command, CommandArgumentValue,
-    CommandSource, Flow, Hooks, Identifier, LoopContext, PlayerRef, PlayerRespawnedEvent,
-    PlayerTabListNameFormatEvent, RegisterCommandsEvent, RunModCommandEvent, ServerAboutToStartEvent,
-    ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
+    BossBarColor, BossBarOverlay, Command, CommandArgumentValue, CommandSource, Flow, Hooks,
+    LoopContext, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
+    PermissionValueType, PlayerRef, PlayerRespawnedEvent, PlayerTabListNameFormatEvent,
+    RegisterCommandsEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
+    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StatType, Suggestion, TabCompleteEvent,
+    Text,
 };
-use horizon_tab::out::{NumberFmt, ObjectiveMethod};
-use mod_api::{Sidebar, SidebarLine};
+use crate::horizon_tab::out::{NumberFmt, ObjectiveMethod};
+// Calls that exist on Horizon main only (feature `horizon_main_api`, off by default; see HMOD_PORT.md).
+#[cfg(feature = "horizon_main_api")]
+use mod_api::{
+    ClientboundPlayPacket, Identifier, ScoreHolder, Sidebar, SidebarLine, TeamColor,
+};
+#[cfg(feature = "horizon_team_options_api")]
+use mod_api::{TeamCollisionRule, TeamVisibility};
+use crate::horizon_tab::out::TeamParams;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -129,6 +140,44 @@ fn text_of(value: &Value) -> Text {
     text
 }
 
+// `player_latency`, `player_nickname` and `player_hidden` (#17878) exist on Horizon main only. The
+// pinned SDK has no read, so without the feature `%ping%` is 0, no nickname is read and nobody is vanished.
+#[cfg(feature = "horizon_main_api")]
+fn ping_of(host: &dyn ServerHost, player: PlayerRef) -> i32 {
+    player.latency(host).unwrap_or(0)
+}
+#[cfg(not(feature = "horizon_main_api"))]
+fn ping_of(_: &dyn ServerHost, _: PlayerRef) -> i32 {
+    0
+}
+#[cfg(feature = "horizon_main_api")]
+fn nickname_of(host: &dyn ServerHost, player: PlayerRef) -> Option<String> {
+    player.nickname(host).flatten()
+}
+#[cfg(not(feature = "horizon_main_api"))]
+fn nickname_of(_: &dyn ServerHost, _: PlayerRef) -> Option<String> {
+    None
+}
+// `player_protocol_version` (#18797, branch `api-player-protocol`) is not on the pinned SDK. Without the
+// feature `%player-version%` shows protocol 0 (no version name).
+#[cfg(feature = "horizon_protocol_api")]
+fn protocol_of(host: &dyn ServerHost, player: PlayerRef) -> i32 {
+    player.protocol_version(host).unwrap_or(0)
+}
+#[cfg(not(feature = "horizon_protocol_api"))]
+fn protocol_of(_: &dyn ServerHost, _: PlayerRef) -> i32 {
+    0
+}
+/// `player_hide` hides a player from everyone below a permission level; any level reads as vanished.
+#[cfg(feature = "horizon_main_api")]
+fn vanished_of(host: &dyn ServerHost, player: PlayerRef) -> bool {
+    player.hidden(host).flatten().is_some()
+}
+#[cfg(not(feature = "horizon_main_api"))]
+fn vanished_of(_: &dyn ServerHost, _: PlayerRef) -> bool {
+    false
+}
+
 /// The player as the TAB core reads them each tick.
 fn player_in(host: &dyn ServerHost, player: PlayerRef) -> PlayerIn {
     let entity = player.entity();
@@ -150,13 +199,15 @@ fn player_in(host: &dyn ServerHost, player: PlayerRef) -> PlayerIn {
         health,
         game_mode: player.game_mode(host).map(|mode| mode.id()).unwrap_or(0),
         op_level: player.permission_level(host).unwrap_or(0),
-        ping: player.latency(host).unwrap_or(0),
-        nickname: player.nickname(host).flatten(),
-        // A player hidden by `player_hide` (a level set) is vanished.
-        vanished: player.hidden(host).flatten().is_some(),
+        ping: ping_of(host, player),
+        nickname: nickname_of(host, player),
+        vanished: vanished_of(host, player),
+        invisible: entity.is_invisible(host).unwrap_or(false),
+        deaths: player
+            .stat(host, StatType::Custom, "minecraft:deaths")
+            .unwrap_or(0),
         entity_id: entity.id() as i32,
-        // TODO(arismoko-api: player_client_protocol): no protocol read; `%player-version%` is wrong.
-        protocol: 0,
+        protocol: protocol_of(host, player),
         fake: player.is_fake(host).unwrap_or(false),
     }
 }
@@ -185,15 +236,32 @@ fn player_info_body(action: u8, entries: &[(u128, i32)]) -> Vec<u8> {
     body
 }
 
-/// Sends one player-info action to `viewer` alone, through `player_send_packet`.
+/// Sends one player-info action to `viewer` alone.
+// HMOD-GAP(player_send_packet): Horizon main has no server-side call that sends a clientbound play
+// packet to one player (only the client's `send_packet`). Latency and game mode per viewer are not
+// sent; the bodies are still built by `player_info_body`.
+#[cfg(not(feature = "horizon_main_api"))]
 fn send_player_info(host: &mut dyn ServerHost, viewer: u128, action: u8, entries: &[(u128, i32)]) {
-    let Some(player) = host.player(viewer) else {
-        return;
+    let _ = (host, viewer, player_info_body(action, entries));
+}
+
+/// `player_send_packet` of Horizon main sends the packet to that player as it is.
+#[cfg(feature = "horizon_main_api")]
+fn send_player_info(host: &mut dyn ServerHost, viewer: u128, action: u8, entries: &[(u128, i32)]) {
+    let Some(player) = host.player(viewer) else { return };
+    let Ok(id) = Identifier::parse("minecraft:player_info_update") else { return };
+    let packet = ClientboundPlayPacket::new(id, player_info_body(action, entries));
+    let _ = host.player_send_packet(player, packet);
+}
+
+/// The permission answer for a Boolean node, asked of the game as a typed query. Any refusal
+/// (an undeclared node, a player the server does not know) is a denial, never a grant.
+fn host_answer(host: &mut dyn ServerHost, uuid: u128, node: &str) -> Option<bool> {
+    let Some(player) = host.player(uuid) else {
+        return Some(false);
     };
-    let Ok(id) = Identifier::parse("minecraft:player_info_update") else {
-        return;
-    };
-    let _ = host.player_send_packet(player, ClientboundPlayPacket::new(id, player_info_body(action, entries)));
+    let node = PermissionNode::new(node, PermissionValueType::Boolean);
+    Some(player.permission_bool(host, &node).unwrap_or(false))
 }
 
 /// The packets the core answers, sent to the players they name.
@@ -219,16 +287,16 @@ fn send(host: &mut dyn ServerHost, packets: Vec<Packet>) {
             // TODO(arismoko-api: watch_server_packets): the anti-override guard (`guard_packet`)
             // is not wired: other senders' team, latency, game mode and name packets are not
             // put back.
-            Out::DisplayNames(entries) => display_names(host, entries),
-            Out::TeamCreate { name, params, players } => team(host, &name, params.color, Some(players)),
-            Out::TeamUpdate { name, params } => team(host, &name, params.color, None),
-            Out::TeamRemove { name } => {
-                let mut st = state();
-                if st.teams.remove(&name).is_some() {
-                    drop(st);
-                    host.team_remove(&name);
-                }
+            Out::DisplayNames(entries) => display_names(host, to, entries),
+            Out::TeamCreate { name, params, players } => {
+                team(host, &name, params.color, Some(players));
+                team_options(host, &name, &params);
             }
+            Out::TeamUpdate { name, params } => {
+                team(host, &name, params.color, None);
+                team_options(host, &name, &params);
+            }
+            Out::TeamRemove { name } => team_remove(host, &name),
             out @ (Out::Objective { .. } | Out::DisplaySlot { .. } | Out::Score { .. } | Out::ResetScore { .. }) => {
                 if state().views.entry(to).or_default().apply(out) {
                     changed.insert(to);
@@ -249,6 +317,9 @@ struct State {
     teams: HashMap<String, Option<i32>>,
     /// Player name -> team they were put on.
     members: HashMap<String, String>,
+    /// Team name -> the options last applied to it (prefix, suffix, visibility, collision, friendly fire).
+    #[cfg_attr(not(feature = "horizon_team_options_api"), allow(dead_code))]
+    team_options: HashMap<String, TeamParams>,
     /// Player -> list name JSON as last set (None = real name).
     list_names: HashMap<u128, Option<String>>,
     views: HashMap<u128, View>,
@@ -313,39 +384,59 @@ impl View {
     }
 }
 
-/// The viewer's sidebar from their objectives: lines by score, highest first (as vanilla sorts),
-/// the line's text its display (else the owner), the right side its number format (else the score).
-fn sidebar(host: &mut dyn ServerHost, viewer: u128) {
-    let built = {
-        let st = state();
-        st.views.get(&viewer).and_then(|v| {
-            let name = v.sidebar.as_ref()?;
-            let title = v.titles.get(name).cloned().unwrap_or(Value::String(String::new()));
-            let mut rows: Vec<_> = v.scores.get(name).map(|m| m.iter().map(|(o, r)| (o.clone(), r.clone())).collect()).unwrap_or_default();
-            rows.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
-            Some((title, rows))
-        })
-    };
-    let Some(player) = host.player(viewer) else { return };
-    let sidebar = built.map(|(title, rows)| {
-        let lines = rows
+impl View {
+    /// The sidebar objective's title and rows (text, right-hand value), as vanilla orders them:
+    /// highest score first, equal scores by name, at most 15. The text is the line's display (else
+    /// its owner); the right side is the number format's text, nothing for `blank`, else the score.
+    #[cfg_attr(not(feature = "horizon_main_api"), allow(dead_code))]
+    fn sidebar_rows(&self) -> Option<(Value, Vec<(Value, Option<Value>)>)> {
+        let name = self.sidebar.as_ref()?;
+        let title = self.titles.get(name)?.clone();
+        let mut rows: Vec<(&String, &(i32, Option<Value>, Option<NumberFmt>))> =
+            self.scores.get(name).into_iter().flatten().collect();
+        rows.sort_by(|a, b| {
+            b.1.0.cmp(&a.1.0).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        });
+        let rows = rows
             .into_iter()
             .take(15)
             .map(|(owner, (score, display, format))| {
-                let text = display.map(|d| text_json(&*host, &d)).unwrap_or_else(|| Text::literal(owner.as_str()));
+                let text = display.clone().unwrap_or_else(|| Value::String(owner.clone()));
                 let value = match format {
                     Some(NumberFmt::Blank) => None,
-                    Some(NumberFmt::Fixed(v)) => Some(text_json(&*host, &v)),
-                    None => Some(Text::literal(score.to_string().as_str())),
+                    Some(NumberFmt::Fixed(v)) => Some(v.clone()),
+                    None => Some(Value::String(score.to_string())),
                 };
-                SidebarLine::new(text, value)
+                (text, value)
+            })
+            .collect();
+        Some((title, rows))
+    }
+}
+
+/// The viewer's sidebar from their objectives (`player_set_sidebar`).
+// HMOD-GAP(set_sidebar): the pinned SDK has no sidebar call; the objectives are still kept by
+// `View::apply`. With `horizon_main_api` the sidebar of Horizon main (#17948) shows them.
+#[cfg(not(feature = "horizon_main_api"))]
+fn sidebar(host: &mut dyn ServerHost, viewer: u128) {
+    let _ = (host, viewer);
+}
+
+#[cfg(feature = "horizon_main_api")]
+fn sidebar(host: &mut dyn ServerHost, viewer: u128) {
+    let Some(player) = host.player(viewer) else { return };
+    let rows = state().views.get(&viewer).and_then(View::sidebar_rows);
+    let shown = rows.map(|(title, rows)| {
+        let lines = rows
+            .iter()
+            .map(|(text, value)| {
+                let value = value.as_ref().map(|v| text_json(&*host, v));
+                SidebarLine::new(text_json(&*host, text), value)
             })
             .collect();
         Sidebar::new(text_json(&*host, &title), lines)
     });
-    if let Err(e) = player.set_sidebar(host, sidebar) {
-        log(&format!("sidebar not set: {e:?}"));
-    }
+    let _ = player.set_sidebar(host, shown);
 }
 
 /// `TeamColor` index (0..15) to the chat colour name `team_set` takes.
@@ -354,42 +445,151 @@ const COLORS: [&str; 16] = [
     "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white",
 ];
 
-/// A TAB team (name tags and sorting) as a team of the world's scoreboard (`team_set`/`team_join`).
-/// The core sends the same team to every viewer; the engine's teams are shared, so each change is
-/// made once. TODO(arismoko-api: team prefix/suffix/visibility/collision): `team_set` takes the colour
-/// only, so TAB's tag prefix and suffix are not shown (the colour is).
+#[cfg(feature = "horizon_main_api")]
+fn team_color(index: i32) -> Option<TeamColor> {
+    Some(match index {
+        0 => TeamColor::Black,
+        1 => TeamColor::DarkBlue,
+        2 => TeamColor::DarkGreen,
+        3 => TeamColor::DarkAqua,
+        4 => TeamColor::DarkRed,
+        5 => TeamColor::DarkPurple,
+        6 => TeamColor::Gold,
+        7 => TeamColor::Gray,
+        8 => TeamColor::DarkGray,
+        9 => TeamColor::Blue,
+        10 => TeamColor::Green,
+        11 => TeamColor::Aqua,
+        12 => TeamColor::Red,
+        13 => TeamColor::LightPurple,
+        14 => TeamColor::Yellow,
+        15 => TeamColor::White,
+        _ => return None,
+    })
+}
+
+/// A TAB team (name tags and sorting) as a team of the world's scoreboard.
+// HMOD-GAP(team_prefix_suffix): the pinned SDK has no scoreboard team calls at all, so the core's
+// team packets are dropped. With `horizon_main_api` (the teams of PR #17980) a team takes its
+// colour and members only: no prefix, suffix, name tag visibility, collision or friendly fire.
+#[cfg(not(feature = "horizon_main_api"))]
 fn team(host: &mut dyn ServerHost, name: &str, color: Option<i32>, players: Option<Vec<String>>) {
+    let _ = (host, name, color, players, COLORS);
+}
+
+#[cfg(feature = "horizon_main_api")]
+fn team(host: &mut dyn ServerHost, name: &str, color: Option<i32>, players: Option<Vec<String>>) {
+    let handle = match host.team(name) {
+        Some(handle) => handle,
+        None => match host.add_team(name) {
+            Ok(handle) => handle,
+            Err(_) => return,
+        },
+    };
     let mut st = state();
+    // The core sends each viewer the same team, so only a change is applied.
     if st.teams.get(name) != Some(&color) {
-        let c = color.and_then(|i| usize::try_from(i).ok()).and_then(|i| COLORS.get(i).copied());
-        if host.team_set(name, c) {
-            st.teams.insert(name.to_owned(), color);
-        } else {
-            log(&format!("team {name} not set"));
-            return;
-        }
+        let _ = host.team_set_color(handle.clone(), color.and_then(team_color));
+        st.teams.insert(name.to_owned(), color);
     }
     for player in players.into_iter().flatten() {
-        if st.members.get(&player).map(String::as_str) != Some(name) && host.team_join(name, &player) {
+        if st.members.get(&player).map(String::as_str) != Some(name) {
+            let _ = host.team_join(handle.clone(), ScoreHolder::Name(player.clone()));
             st.members.insert(player, name.to_owned());
         }
     }
 }
 
-/// TAB's tab list names. The core sends them per viewer; `set_list_name` is the same for everyone,
-/// so a name is set when it differs from the last one set (TODO(arismoko-api: per-viewer list names)).
-fn display_names(host: &mut dyn ServerHost, entries: Vec<(u128, Option<Value>)>) {
-    for (target, value) in entries {
-        let key = value.as_ref().map(Value::to_string);
-        if state().list_names.get(&target) == Some(&key) {
+#[cfg(not(feature = "horizon_main_api"))]
+fn team_remove(host: &mut dyn ServerHost, name: &str) {
+    let _ = (host, name);
+}
+
+#[cfg(feature = "horizon_main_api")]
+fn team_remove(host: &mut dyn ServerHost, name: &str) {
+    if let Some(handle) = host.team(name) {
+        let _ = host.team_remove(handle);
+    }
+    let mut st = state();
+    st.teams.remove(name);
+    st.members.retain(|_, team| team != name);
+    #[cfg(feature = "horizon_team_options_api")]
+    st.team_options.remove(name);
+}
+
+/// The team options of TAB's team packets beyond the colour: prefix, suffix, name tag visibility,
+/// collision rule and friendly fire (`team_set_prefix` and the setters of the branch
+/// `api-scoreboard-team-options`, #18817). Without the feature the packet's options are dropped.
+// HMOD-GAP(team_prefix_suffix): see `team` above; without `horizon_team_options_api` only the colour shows.
+#[cfg(not(feature = "horizon_team_options_api"))]
+fn team_options(host: &mut dyn ServerHost, name: &str, params: &TeamParams) {
+    let _ = (host, name, params);
+}
+
+#[cfg(feature = "horizon_team_options_api")]
+fn team_options(host: &mut dyn ServerHost, name: &str, params: &TeamParams) {
+    let Some(handle) = host.team(name) else {
+        return;
+    };
+    if state().team_options.get(name) == Some(params) {
+        return;
+    }
+    let prefix = text_json(&*host, &params.prefix);
+    let suffix = text_json(&*host, &params.suffix);
+    let _ = host.team_set_prefix(handle.clone(), prefix);
+    let _ = host.team_set_suffix(handle.clone(), suffix);
+    let _ = host.team_set_name_tag_visibility(handle.clone(), visibility_of(params.visibility));
+    let _ = host.team_set_collision_rule(handle.clone(), collision_of(params.collision));
+    let _ = host.team_set_friendly_fire(handle, (params.options & 1) != 0);
+    state().team_options.insert(name.to_owned(), params.clone());
+}
+
+/// `Team.Visibility` as TAB's number (0 always, 1 never, 2 hide for other teams, 3 hide for own team).
+#[cfg(feature = "horizon_team_options_api")]
+fn visibility_of(index: i32) -> TeamVisibility {
+    match index {
+        1 => TeamVisibility::Never,
+        2 => TeamVisibility::HideForOtherTeams,
+        3 => TeamVisibility::HideForOwnTeam,
+        _ => TeamVisibility::Always,
+    }
+}
+
+/// `Team.CollisionRule` as TAB's number (0 always, 1 never, 2 push other teams, 3 push own team).
+#[cfg(feature = "horizon_team_options_api")]
+fn collision_of(index: i32) -> TeamCollisionRule {
+    match index {
+        1 => TeamCollisionRule::Never,
+        2 => TeamCollisionRule::PushOtherTeams,
+        3 => TeamCollisionRule::PushOwnTeam,
+        _ => TeamCollisionRule::Always,
+    }
+}
+
+/// TAB's tab list names. The core sends them per viewer, `player_set_list_name` is the same for
+/// everyone, so only the name a player's own view gets is set (and only when it changed).
+// HMOD-GAP(set_list_name): the pinned SDK has no tab list name setter, so the core's names are not
+// sent; the `player_tab_list_name_format` hook still sets one name per player.
+#[cfg(not(feature = "horizon_main_api"))]
+fn display_names(host: &mut dyn ServerHost, viewer: u128, entries: Vec<(u128, Option<Value>)>) {
+    let _ = (host, viewer, entries);
+}
+
+#[cfg(feature = "horizon_main_api")]
+fn display_names(host: &mut dyn ServerHost, viewer: u128, entries: Vec<(u128, Option<Value>)>) {
+    for (uuid, name) in entries {
+        if uuid != viewer {
             continue;
         }
-        let text = value.map(|v| text_json(&*host, &v));
-        if let Some(player) = host.player(target) {
-            if matches!(player.set_list_name(host, text), Ok(true)) {
-                state().list_names.insert(target, key);
-            }
+        let key = name.as_ref().map(Value::to_string);
+        if state().list_names.get(&uuid) == Some(&key) {
+            continue;
         }
+        let text = name.as_ref().map(|json| text_json(&*host, json));
+        if let Some(player) = host.player(uuid) {
+            let _ = player.set_list_name(host, text);
+        }
+        state().list_names.insert(uuid, key);
     }
 }
 
@@ -467,6 +667,23 @@ fn boss(host: &mut dyn ServerHost, viewer: u128, id: u128, action: BossOut) {
 
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        // The original plugin.yml declares every `tab.*` node with `default: op`, so each one gets operator
+        // level 1 here, `tab.spectatorbypass` included. The `tab.group.<name>` nodes come from the config.
+        let mut names = api::command_permission_nodes();
+        names.push("tab.staff".to_owned());
+        names.push("tab.bypass".to_owned());
+        names.push("tab.seevanished".to_owned());
+        names.extend(api::group_permission_nodes(Path::new("config")));
+        names.extend(api::condition_permission_nodes(Path::new("config")));
+        for name in names {
+            let node = PermissionNode::new(name, PermissionValueType::Boolean);
+            let _ = event.nodes.add(node, NodeDefault::Level(PermissionLevel::from_level(1)));
+        }
+        let bypass = PermissionNode::new("tab.spectatorbypass", PermissionValueType::Boolean);
+        let _ = event.nodes.add(bypass, NodeDefault::Level(PermissionLevel::from_level(1)));
+    }
+
     fn server_about_to_start(&self, _: &mut dyn ServerHost, _: &mut ServerAboutToStartEvent) {
         if api::started() {
             return;
@@ -475,14 +692,48 @@ impl Hooks for Mod {
         for line in api::start(Path::new("config")) {
             log(&line);
         }
-        log("ported to arismoko: tab list, chat, boss bars, commands, name format, latency, game mode,");
-        log("teams (colour only), list names and the sidebar; tag prefix/suffix, below-name and list objectives are not");
+        log("ported: tab list header/footer, one list name per player, boss bars, chat, commands and placeholders.");
+        #[cfg(feature = "horizon_main_api")]
+        log("Shown: sidebar, list names, team colours, ping and game mode. Not shown: team prefixes/suffixes, below-name and list objectives.");
+        #[cfg(not(feature = "horizon_main_api"))]
+        log("Not shown yet: scoreboard teams (name tags, sorting), sidebar, below-name and list objectives, ping and game mode.");
+    }
+
+    /// Online names for a `<name:player_name>` slot of `/tab` (the registered usage is a word, which takes
+    /// offline names too; `api::player_name_expected` finds the slot).
+    fn tab_complete(&self, host: &mut dyn ServerHost, event: &mut TabCompleteEvent<'_>) {
+        let line = event.command.trim_start_matches('/');
+        let mut words: Vec<&str> = line.split(' ').collect();
+        let root = words.remove(0);
+        if !root.eq_ignore_ascii_case("tab") || words.is_empty() {
+            return;
+        }
+        // TAB's `/tab` completes nothing for a sender without `tab.tabcomplete` (or `tab.admin`).
+        let may_complete = ["tab.admin", "tab.tabcomplete"]
+            .iter()
+            .any(|node| host_answer(host, event.player, node) == Some(true));
+        if !may_complete {
+            return;
+        }
+        let usages: Vec<String> = api::commands().into_iter().map(|(usage, _)| usage).collect();
+        if !api::player_name_expected(&usages, root, &words) {
+            return;
+        }
+        let typed = words.last().copied().unwrap_or("").to_lowercase();
+        let [start, end] = event.range;
+        for player in host.players().server_players() {
+            let Some(name) = player.name(&*host) else {
+                continue;
+            };
+            if name.to_lowercase().starts_with(&typed) && !event.suggestions.iter().any(|s| s.text == name) {
+                event.suggestions.push(Suggestion::new((start, end), name));
+            }
+        }
     }
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         for (usage, level) in api::commands() {
-            // A word takes any name (an offline one too), so the usages carry no name completion.
-            // TODO(arismoko-api: player_name argument kind): no name completion meanwhile.
+            // A word takes any name (an offline one too); `tab_complete` suggests the online names.
             let usage = usage.replace(":player_name>", ":word>");
             event.commands.push(if level == 0 {
                 Command::new(&usage)
@@ -531,7 +782,7 @@ impl Hooks for Mod {
                 // `tab.admin`/`tab.grouplist` holders; parents: `tab.admin` is checked by the core).
                 let now = now_ms();
                 for node in api::command_permission_nodes() {
-                    let answer = host.player(player.uuid()).and_then(|p| p.permission_value(&*host, &node));
+                    let answer = host_answer(host, player.uuid(), &node);
                     api::host_permission_answer(player.uuid(), &node, answer, now);
                 }
                 api::command(Some((player.uuid(), permission.level())), &line)
@@ -579,11 +830,11 @@ impl Hooks for Mod {
         // no permissions mod answers, so the operator level decides).
         let now = now_ms();
         for (uuid, node) in api::host_permission_requests(now) {
-            let answer = host.player(uuid).and_then(|p| p.permission_value(&*host, &node));
+            let answer = host_answer(host, uuid, &node);
             api::host_permission_answer(uuid, &node, answer, now);
         }
         let present: HashSet<u128> = online.iter().map(|p| p.uuid()).collect();
-        horizon_tab::integration::host_permissions_retain(&present);
+        crate::horizon_tab::integration::host_permissions_retain(&present);
         let players: Vec<PlayerIn> = online
             .into_iter()
             .map(|player| player_in(&*host, player))
@@ -625,5 +876,79 @@ impl Hooks for Mod {
     fn server_stopping(&self, host: &mut dyn ServerHost, _: &mut ServerStoppingEvent) {
         let packets = api::stop();
         send(host, packets);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sidebar_rows_sort_by_score_then_name_and_apply_formats() {
+        let mut view = View::default();
+        view.apply(Out::Objective {
+            name: "sb".into(),
+            method: ObjectiveMethod::Add,
+            title: json!("Title"),
+            hearts: false,
+            format: None,
+        });
+        view.apply(Out::DisplaySlot { slot: 1, objective: "sb".into() });
+        for (owner, score, display, format) in [
+            ("b", 3, None, None),
+            ("a", 3, Some(json!("Shown")), Some(NumberFmt::Fixed(json!("x")))),
+            ("c", 9, None, Some(NumberFmt::Blank)),
+        ] {
+            view.apply(Out::Score { owner: owner.into(), objective: "sb".into(), score, display, format });
+        }
+        let (title, rows) = view.sidebar_rows().unwrap();
+        assert_eq!(title, json!("Title"));
+        assert_eq!(
+            rows,
+            vec![
+                (json!("c"), None),
+                (json!("Shown"), Some(json!("x"))),
+                (json!("b"), Some(json!("3"))),
+            ]
+        );
+    }
+
+    #[test]
+    fn sidebar_rows_are_none_without_a_sidebar_and_capped_at_15() {
+        let mut view = View::default();
+        assert!(view.sidebar_rows().is_none());
+        view.apply(Out::Objective {
+            name: "sb".into(),
+            method: ObjectiveMethod::Add,
+            title: json!("T"),
+            hearts: false,
+            format: None,
+        });
+        view.apply(Out::DisplaySlot { slot: 1, objective: "sb".into() });
+        for i in 0..20 {
+            view.apply(Out::Score {
+                owner: format!("o{i:02}"),
+                objective: "sb".into(),
+                score: i,
+                display: None,
+                format: None,
+            });
+        }
+        assert_eq!(view.sidebar_rows().unwrap().1.len(), 15);
+    }
+
+    // TAB's team numbers map to the vocabulary's variants, in TAB's order (0 is the default).
+    #[cfg(feature = "horizon_team_options_api")]
+    #[test]
+    fn team_numbers_map_to_visibility_and_collision() {
+        assert_eq!(visibility_of(0), TeamVisibility::Always);
+        assert_eq!(visibility_of(1), TeamVisibility::Never);
+        assert_eq!(visibility_of(2), TeamVisibility::HideForOtherTeams);
+        assert_eq!(visibility_of(3), TeamVisibility::HideForOwnTeam);
+        assert_eq!(collision_of(0), TeamCollisionRule::Always);
+        assert_eq!(collision_of(1), TeamCollisionRule::Never);
+        assert_eq!(collision_of(2), TeamCollisionRule::PushOtherTeams);
+        assert_eq!(collision_of(3), TeamCollisionRule::PushOwnTeam);
     }
 }

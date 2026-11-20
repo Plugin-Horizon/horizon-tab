@@ -1,14 +1,14 @@
 //! TAB's own placeholders (`%player%`, `%ping%`, `%online%`, `%animation:Name%`,
 //! `%condition:name%`...), its output replacements and refresh intervals, with every other
-//! `%identifier_params%` handed to the placeholder registry ([`crate::placeholders`]). Names and
+//! `%identifier_params%` handed to the placeholder registry ([`crate::horizon_tab::placeholders`]). Names and
 //! default refresh intervals follow TAB's `TabConstants.Placeholder` (Apache-2.0, NOTICE).
 
-use crate::conditions::Condition;
-use crate::config::Config;
-use crate::integration;
-use crate::placeholders::{self, builtin, Player, Server};
-use crate::text;
-use crate::yaml::Yaml;
+use crate::horizon_tab::conditions::Condition;
+use crate::horizon_tab::config::Config;
+use crate::horizon_tab::integration;
+use crate::horizon_tab::placeholders::{self, builtin, Player, Server};
+use crate::horizon_tab::text;
+use crate::horizon_tab::yaml::Yaml;
 use chrono::{FixedOffset, TimeZone};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,6 +19,8 @@ pub struct TabPlayer {
     pub p: Player,
     pub group: String,
     pub bedrock: bool,
+    /// Whether the player's team collides (`/tab setcollision`, else `scoreboard-teams.enable-collision`).
+    pub collision: bool,
     pub version_id: i32,
     pub version_name: String,
 }
@@ -77,6 +79,9 @@ fn builtin_interval(token: &str) -> Option<i64> {
         | "%memory-max-gb%"
         | "%bedrock%" => -1,
         "%vanished%"
+        | "%invisible%"
+        | "%collision%"
+        | "%deaths%"
         | "%worldonline%"
         | "%serveronline%"
         | "%online%"
@@ -313,6 +318,9 @@ impl TabPlaceholders {
             "%group%" => t.group.clone(),
             "%ping%" => p.ping.to_string(),
             "%vanished%" => p.vanished.to_string(),
+            "%invisible%" => p.invisible.to_string(),
+            "%deaths%" => p.deaths.to_string(),
+            "%collision%" => t.collision.to_string(),
             "%gamemode%" => p.game_mode.to_string(),
             "%health%" => ((p.health as f64).ceil() as i64).to_string(),
             "%bedrock%" => t.bedrock.to_string(),
@@ -322,8 +330,8 @@ impl TabPlaceholders {
             "%worldonline%" => visible().filter(|o| o.p.world == p.world).count().to_string(),
             "%staffonline%" => visible().filter(|o| staff(*o)).count().to_string(),
             "%nonstaffonline%" => visible().filter(|o| !staff(*o)).count().to_string(),
-            "%time%" => crate::datefmt::format(&self.time_format, &self.now_local()),
-            "%date%" => crate::datefmt::format(&self.date_format, &self.now_local()),
+            "%time%" => crate::horizon_tab::datefmt::format(&self.time_format, &self.now_local()),
+            "%date%" => crate::horizon_tab::datefmt::format(&self.date_format, &self.now_local()),
             "%memory-used%" => ctx.server.memory_used_mb.to_string(),
             "%memory-max%" => ctx.server.memory_max_mb.to_string(),
             "%memory-used-gb%" => builtin::two_decimals(ctx.server.memory_used_mb as f64 / 1024.0),
@@ -394,8 +402,8 @@ mod tests {
     }
 
     fn ph() -> TabPlaceholders {
-        let cfg = Config::from_yaml(&crate::yaml::parse(include_str!("../testdata/config.yml")).unwrap());
-        let anim = load_animations(&crate::yaml::parse(include_str!("../testdata/animations.yml")).unwrap());
+        let cfg = Config::from_yaml(&crate::horizon_tab::yaml::parse(include_str!("../../data/tab/testdata/config.yml")).unwrap());
+        let anim = load_animations(&crate::horizon_tab::yaml::parse(include_str!("../../data/tab/testdata/animations.yml")).unwrap());
         TabPlaceholders::new(&cfg, anim)
     }
 
@@ -442,6 +450,19 @@ mod tests {
         assert!(ph.short_met("%world%=world", &ctx));
         assert!(!ph.short_met("%world%=disabledworld", &ctx));
         assert!(ph.short_met("%player-version-id%>=765;%bedrock%=false", &ctx));
+    }
+
+    #[test]
+    fn deaths_invisible_collision_placeholders() {
+        let mut ph = ph();
+        let mut t = player("Steve", 1);
+        t.p.deaths = 7;
+        t.p.invisible = true;
+        t.collision = true;
+        let all = vec![t.clone()];
+        let server = Server::default();
+        let ctx = Ctx { target: &all[0], viewer: &all[0], all: &all, server: &server };
+        assert_eq!(ph.parse("%deaths% %invisible% %collision%", &ctx), "7 true true");
     }
 
     #[test]

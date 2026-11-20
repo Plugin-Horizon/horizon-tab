@@ -8,7 +8,7 @@
 //! surrogates; Rust strings cannot hold those, so numbers use base U+D7FF (all below the
 //! surrogates, so the client's UTF-16 order is the code point order) with the same skip of `\`.
 
-use crate::text;
+use crate::horizon_tab::text;
 
 pub const TEAM_NAME_LENGTH: usize = 16;
 const DEFAULT_NUMBER: f64 = (i32::MAX / 2) as f64;

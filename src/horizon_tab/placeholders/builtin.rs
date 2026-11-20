@@ -130,7 +130,7 @@ impl Expansion for ServerExpansion {
         let lower = params.to_ascii_lowercase();
         if let Some(fmt) = params.strip_prefix("time_") {
             let now = chrono::Local::now().fixed_offset();
-            return Some(crate::datefmt::format(fmt, &now));
+            return Some(crate::horizon_tab::datefmt::format(fmt, &now));
         }
         Some(match lower.as_str() {
             "online" => s.online.to_string(),

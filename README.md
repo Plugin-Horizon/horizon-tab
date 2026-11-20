@@ -1,5 +1,9 @@
 # horizon-tab
 
+## Port status
+
+Compared with TAB 6.2.2-SNAPSHOT (7d62062) (estimate): **37 %** of the original's commands, permissions, config keys, messages and features work today; **37 %** once our open Horizon PRs are merged; **46 %** with the engine changes we are writing; **40 %** with the newest Horizon SDK. Estimated count: 42/115 items. Status: not yet compiled after the 2026-11-20 round.
+
 > **Unofficial Rust port of TAB for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the TAB authors.**
 
 **Not affiliated with TAB (NEZNAMY) or PlaceholderAPI (HelpChat).**
@@ -16,9 +20,16 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
 
 ## What it does
 
+Only part of the list below is visible on Horizon today: header/footer, one tab list name per player (the same for
+every viewer), boss bars, chat lines, commands and placeholders work. Name tags and sorting (scoreboard teams), the
+sidebar, the below-name and list objectives, ping bars and game-mode updates compute their data but nothing is sent
+to players yet; see Known gaps.
+
 - Reads TAB's own files from `config/tab/` (beside `server.properties`): `config.yml`, `groups.yml`, `users.yml`,
   `animations.yml`, `messages.yml`, `playerdata.yml`. A Bukkit server's `plugins/TAB/` folder can be copied there as it
   is; `/tab player|group ...` writes the same files back. Missing files are created with TAB's defaults.
+- With `mysql.enabled: true` groups and users are kept in the MySQL tables `tab_groups` and `tab_users` instead (TAB's
+  layout); `/tab mysql upload|download` copy between the tables and the two files. Not compiled yet (see Known gaps).
 - Tab list names: `tabprefix` + `customtabname` + `tabsuffix`, looked up as TAB does (per world, per server, user by
   name, user by UUID, group, `_DEFAULT_`).
 - Name tags: one team per player with `tagprefix` / `tagsuffix`, the team colour taken from the prefix's last colour,
@@ -33,7 +44,7 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
   `<gradient:#RRGGBB>text</gradient:#RRGGBB>`) and, with `components.minimessage-support`, common MiniMessage tags.
 - Commands, as TAB 6.2.2 has them: `/tab reload | parse | player | playeruuid | group | groups | debug | dump | cpu |
   mysql | scoreboard | bossbar | nametag | setcollision` and the scoreboard toggle command (`/sb`), with TAB's
-  permission nodes (`tab.admin` allows all). `cpu`, `dump` and `mysql` need parts that are not ported, see the Known gaps section.
+  permission nodes (`tab.admin` allows all). `cpu` and `dump` need parts that are not ported, see the Known gaps section.
 
 What is ported and what is not: the Known gaps section. What Horizon would need to do it without internals:
 the Known gaps section.
@@ -77,11 +88,16 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
-- Team prefixes and suffixes are not shown (only the colour); the tab-list and below-name objective slots are dropped.
+- With the Cargo feature `horizon_main_api` (needs a Horizon build that has the calls of main and PR #17980; off by default) ping, nickname, vanished, the sidebar, list names (the player's own view) and team colours and members work; the rest of this list stays.
+- With `horizon_team_options_api` (needs `horizon_main_api` and the team setters of branch `api-scoreboard-team-options`, PR #17980 stack) team prefixes, suffixes, name tag visibility, collision rules and friendly fire are set. With `horizon_protocol_api` (branch `api-player-protocol`) `%player-version%` shows the client's version. Both are off by default and were written without a compile.
+- Without `horizon_team_options_api`, scoreboard teams show the colour only (no name tag prefix/suffix, visibility or collision, no team sorting); without `horizon_main_api` they show nothing. The sidebar and the tab-list and below-name objective slots are dropped; ping and game mode are not sent.
 - The anti-override guard is off (outgoing packets cannot be watched), so other senders' team, latency or name packets are not put back.
-- `%player-version%` is wrong (no protocol read); name completion falls back to plain words.
+- `%player-version%` is wrong without `horizon_protocol_api` (no protocol read). Player-name arguments of `/tab` complete online names, only for senders with `tab.tabcomplete`; the literal sub-command words are not filtered per sender. An offline name is still accepted as typed.
 - A toggle named like a vanilla command (`/bossbar`) is only reachable as `/tab bossbar`.
 - List names are per player, not per viewer.
+- MySQL storage (`mysql.enabled`) is blind-written and not compiled yet. Its database calls run on the server thread (TAB uses a
+  thread of its own), so a join or an upload waits for them. `/tab dump` does not show the `mysql` section. Rows with
+  unknown properties get no `checkProperty` warning.
 
 ## Licence and origin
 

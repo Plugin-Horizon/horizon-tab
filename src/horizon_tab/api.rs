@@ -5,17 +5,17 @@
 //! prefixes, vanish, Bedrock), [`parse`] (TAB placeholders for an online player) and the TAB
 //! expansion's values (`%tab_tabprefix%`... when `placeholders.register-tab-expansion` is on).
 
-use crate::commands::{self, Output, Seg, Sender};
-use crate::engine::{Engine, PlayerIn};
-use crate::out::Packet;
-use crate::placeholders::{self, Player, Server};
-use crate::properties::VALID_PROPERTIES;
+use crate::horizon_tab::commands::{self, Output, Seg, Sender};
+use crate::horizon_tab::engine::{Engine, PlayerIn};
+use crate::horizon_tab::out::Packet;
+use crate::horizon_tab::placeholders::{self, Player, Server};
+use crate::horizon_tab::properties::VALID_PROPERTIES;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, RwLock};
 
-pub use crate::integration::{
+pub use crate::horizon_tab::integration::{
     host_permission_answer, host_permission_requests, register as register_integration,
     unregister as unregister_integration, Integration,
 };
@@ -44,6 +44,7 @@ pub fn command_permission_nodes() -> Vec<String> {
         "tab.parse",
         "tab.reload",
         "tab.remove",
+        "tab.send.bar",
         "tab.scoreboard.show",
         "tab.scoreboard.show.other",
         "tab.scoreboard.toggle",
@@ -54,6 +55,54 @@ pub fn command_permission_nodes() -> Vec<String> {
     .map(|n| (*n).to_owned())
     .collect();
     nodes.extend(VALID_PROPERTIES.iter().map(|p| format!("tab.change.{p}")));
+    nodes
+}
+
+/// The `tab.group.<name>` nodes the config can ask about (`assign-groups-by-permissions`): the names in
+/// `primary-group-finding-list` and the groups of `groups.yml`, read from `<config_dir>/../plugins/TAB/`.
+pub fn group_permission_nodes(config_dir: &Path) -> Vec<String> {
+    let dir = files_dir(config_dir);
+    let read = |name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .ok()
+            .and_then(|t| crate::horizon_tab::yaml::parse(&t).ok())
+    };
+    let mut groups: Vec<String> = read("config.yml")
+        .map(|y| y.get("primary-group-finding-list").str_list())
+        .unwrap_or_default();
+    if let Some(y) = read("groups.yml") {
+        groups.extend(y.keys().into_iter().filter(|k| k != "_DEFAULT_"));
+    }
+    groups.sort();
+    groups.dedup();
+    groups.into_iter().map(|g| format!("tab.group.{g}")).collect()
+}
+
+/// The nodes of `permission:<node>` and `!permission:<node>` conditions in `config.yml` (display,
+/// disable and visibility conditions). The game refuses a typed query of an undeclared node, so
+/// each one is declared here like the others.
+pub fn condition_permission_nodes(config_dir: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(files_dir(config_dir).join("config.yml")).unwrap_or_default();
+    permission_nodes_in(&text)
+}
+
+/// The node after each `permission:` in `text`, up to the first character that ends a condition
+/// (space, quote, `|`, `&`, brackets, `=`, `,`, `#`). Nodes with a placeholder are skipped.
+pub fn permission_nodes_in(text: &str) -> Vec<String> {
+    let mut nodes = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("permission:") {
+        rest = &rest[at + "permission:".len()..];
+        let node: String = rest
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !matches!(c, '|' | '&' | '\'' | '"' | '(' | ')' | '=' | ',' | '#'))
+            .collect();
+        if !node.is_empty() && !node.contains('%') && !node.contains('{') {
+            nodes.push(node);
+        }
+    }
+    nodes.sort();
+    nodes.dedup();
     nodes
 }
 
@@ -204,7 +253,7 @@ pub fn tick(now_ms: i64, server: Server, players: Vec<PlayerIn>) -> Vec<Packet> 
     let mut packets = std::mem::take(&mut s.pending);
     packets.extend(s.engine.tick(now_ms, server, players));
     *list_names().write().unwrap_or_else(|e| e.into_inner()) = s.engine.list_names();
-    crate::integration::host_permissions_retain(&s.engine.all_players().iter().map(|p| p.p.uuid).collect());
+    crate::horizon_tab::integration::host_permissions_retain(&s.engine.all_players().iter().map(|p| p.p.uuid).collect());
     if s.engine.cfg.register_tab_expansion {
         let mut values = HashMap::new();
         for p in s.engine.all_players() {
@@ -266,6 +315,26 @@ fn literal_word(name: &str) -> bool {
 }
 
 /// The commands to register: (usage, operator level). Permission nodes are checked when run.
+/// Whether the word being typed after `/<root>` is a `player_name` slot of one of `usages` (the TAB usage strings).
+/// `args` are the words typed after the root, the last one being the word in progress. The words before it must
+/// match a usage (a `<...>` slot takes any word); the slot itself must be a `<name:player_name>` one.
+pub fn player_name_expected(usages: &[String], root: &str, args: &[&str]) -> bool {
+    let Some(current) = args.len().checked_sub(1) else {
+        return false;
+    };
+    usages.iter().any(|usage| {
+        let tokens: Vec<&str> = usage.split_whitespace().collect();
+        if tokens.first().is_none_or(|t| !t.eq_ignore_ascii_case(root)) || tokens.len() <= current + 1 {
+            return false;
+        }
+        let before_match = args[..current].iter().enumerate().all(|(i, word)| {
+            let token = tokens[i + 1];
+            token.starts_with('<') || token.eq_ignore_ascii_case(word)
+        });
+        before_match && tokens[current + 1].starts_with('<') && tokens[current + 1].ends_with(":player_name>")
+    })
+}
+
 /// One usage per sub-command path with typed arguments, so the client completes the words and the
 /// fixed choices itself. The `text` catch-all comes last: free text and unknown words still reach
 /// `/tab`'s own help and messages. Every usage dispatches to the same `commands::tab` code.
@@ -293,7 +362,7 @@ pub fn commands() -> Vec<(String, u8)> {
     for (root, kind) in [("player", "player_name"), ("playeruuid", "player_name"), ("group", "word")] {
         u.push(format!("tab {root} <name:{kind}>"));
         u.push(format!("tab {root} <name:{kind}> remove"));
-        for p in crate::commands::COMMAND_PROPERTIES {
+        for p in crate::horizon_tab::commands::COMMAND_PROPERTIES {
             u.push(format!("tab {root} <name:{kind}> {p} [value:text]"));
         }
     }
@@ -393,7 +462,7 @@ fn answer(o: Output, minimessage: bool, pending: &mut Vec<Packet>) -> Answer {
                 let parts: Vec<Value> = segs
                     .iter()
                     .map(|seg| match seg {
-                        Seg::Fmt(t) => crate::text::component(t, minimessage),
+                        Seg::Fmt(t) => crate::horizon_tab::text::component(t, minimessage),
                         Seg::Lit(t, color) => serde_json::json!({ "text": t, "color": color }),
                     })
                     .collect();
@@ -401,15 +470,15 @@ fn answer(o: Output, minimessage: bool, pending: &mut Vec<Packet>) -> Answer {
                 plain.push(
                     segs.iter()
                         .map(|seg| match seg {
-                            Seg::Fmt(t) => crate::text::plain(t, minimessage),
+                            Seg::Fmt(t) => crate::horizon_tab::text::plain(t, minimessage),
                             Seg::Lit(t, _) => t.clone(),
                         })
                         .collect(),
                 );
             }
             None => {
-                lines.push(crate::text::component(line, minimessage));
-                plain.push(crate::text::plain(line, minimessage));
+                lines.push(crate::horizon_tab::text::component(line, minimessage));
+                plain.push(crate::horizon_tab::text::plain(line, minimessage));
             }
         }
     }
@@ -535,6 +604,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn condition_permission_nodes_are_read_from_the_conditions() {
+        let text = "display-condition: permission:tab.staff\n\
+                    disable-condition: '!permission:tab.group.vip|%world%=x'\n\
+                    other: permission:tab.staff\n\
+                    text: '%permission:tab.skip%'";
+        assert_eq!(permission_nodes_in(text), vec!["tab.group.vip".to_owned(), "tab.staff".to_owned()]);
+        assert!(permission_nodes_in("no conditions here").is_empty());
+    }
+
+    #[test]
     fn files_are_read_from_the_server_plugin_folder() {
         assert_eq!(files_dir(Path::new("/srv/lobby/config")), PathBuf::from("/srv/lobby/plugins/TAB"));
     }
@@ -559,5 +638,40 @@ mod tests {
         assert_eq!(std::fs::read_to_string(plugin.join("config.yml")).unwrap(), "debug: false\n");
         assert!(!config.join("tab").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod player_name_completion_tests {
+    use super::player_name_expected;
+
+    fn usages() -> Vec<String> {
+        [
+            "tab reload",
+            "tab dump <player:player>",
+            "tab player <name:player_name>",
+            "tab player <name:player_name> remove",
+            "tab player <name:player_name> tabprefix [value:text]",
+            "tab group <name:word>",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+    }
+
+    #[test]
+    fn name_slot_after_a_literal_word() {
+        assert!(player_name_expected(&usages(), "tab", &["player", ""]));
+        assert!(player_name_expected(&usages(), "tab", &["player", "Ste"]));
+    }
+
+    #[test]
+    fn no_name_slot_for_other_words_or_roots() {
+        assert!(!player_name_expected(&usages(), "tab", &["group", ""]));
+        assert!(!player_name_expected(&usages(), "tab", &["dump", ""]));
+        assert!(!player_name_expected(&usages(), "tab", &["player", "Steve", ""]));
+        assert!(!player_name_expected(&usages(), "bossbar", &["player", ""]));
+        assert!(!player_name_expected(&usages(), "tab", &[""]));
+        assert!(!player_name_expected(&usages(), "tab", &[]));
     }
 }

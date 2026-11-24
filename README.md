@@ -2,7 +2,7 @@
 
 ## Port status
 
-Compared with TAB 6.2.2-SNAPSHOT (7d62062) (estimate): **37 %** of the original's commands, permissions, config keys, messages and features work today; **37 %** once our open Horizon PRs are merged; **46 %** with the engine changes we are writing; **40 %** with the newest Horizon SDK. Estimated count: 42/115 items. Status: not yet compiled after the 2026-11-20 round.
+Item list: audit/rec100/tab.md (2026-11-24 count: 15 working of 40 items, 18 need engine APIs). Earlier estimate below is superseded.
 
 > **Unofficial Rust port of TAB for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the TAB authors.**
 

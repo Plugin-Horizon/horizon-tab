@@ -470,7 +470,7 @@ fn display_score(host: &mut dyn ServerHost, viewer: u128, slot: u8, owner: &str,
         .into_iter()
         .find(|p| p.name(&*host).is_some_and(|n| n.eq_ignore_ascii_case(owner)));
     if let Some(target) = target {
-        let _ = host.player_set_display_score(viewer, slot, target, score);
+        let _ = viewer.set_display_score(host, slot, target, score);
     }
 }
 
@@ -506,7 +506,7 @@ fn display_names(host: &mut dyn ServerHost, viewer: u128, entries: Vec<(u128, Op
         }
         let Some(target) = host.player(uuid) else { continue };
         let text = name.as_ref().map(|json| text_json(&*host, json));
-        let _ = host.player_set_list_name_for(viewer_ref, target, text);
+        let _ = viewer_ref.set_list_name_for(host, target, text);
         state().list_names.insert((viewer, uuid), key);
     }
 }

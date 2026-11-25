@@ -137,6 +137,10 @@ pub struct Config {
     pub unsupported: Vec<String>,
     /// `per-world-playerlist` when enabled.
     pub per_world: Option<crate::horizon_tab::perworld::PerWorld>,
+    /// `global-playerlist` when enabled.
+    pub global: Option<crate::horizon_tab::proxy::GlobalCfg>,
+    /// `proxy-support` when enabled.
+    pub proxy_support: Option<ProxySupportCfg>,
     /// `layout` when enabled.
     pub layout: Option<crate::horizon_tab::layout::LayoutCfg>,
     /// Warnings the feature sections gave while reading (invalid slots, duplicate worlds...).
@@ -147,14 +151,17 @@ pub struct Config {
 }
 
 /// Keys of TAB's file that only a proxy reads. The port reads them and does nothing with them.
-pub const PROXY_ONLY_KEYS: &[&str] = &[
-    "proxy-support.enabled",
-    "use-bukkit-permissions-manager",
-    "use-online-uuid-in-tablist",
-    // TAB's GlobalPlayerList only adds players of other servers, and it learns them from the TAB
-    // plugin on the proxy; a backend alone has none to add.
-    "global-playerlist.enabled",
-];
+pub const PROXY_ONLY_KEYS: &[&str] = &["use-bukkit-permissions-manager", "use-online-uuid-in-tablist"];
+
+/// `proxy-support` (TAB's `ProxySupportConfiguration`): the instances' own channel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProxySupportCfg {
+    /// `PLUGIN`, `REDIS` or `RABBITMQ`.
+    pub kind: String,
+    /// `TAB_4_<channel-name-suffix>`.
+    pub channel: String,
+    pub plugin_name: String,
+}
 
 /// Key paths (`*` = any key) of the files TAB keeps that the port reads. `check_original` compares the
 /// original files against this list. Keep it in step with `Config::from_yaml`, `properties.rs` and `tabph.rs`.
@@ -250,6 +257,18 @@ pub const KEYS_READ: &[&str] = &[
     "mysql.password",
     "mysql.useSSL",
     "proxy-support.enabled",
+    "proxy-support.channel-name-suffix",
+    "proxy-support.type",
+    "proxy-support.plugin.name",
+    "proxy-support.redis.url",
+    "proxy-support.rabbitmq.exchange",
+    "proxy-support.rabbitmq.url",
+    "global-playerlist.display-others-as-spectators",
+    "global-playerlist.display-vanished-players-as-spectators",
+    "global-playerlist.isolate-unlisted-servers",
+    "global-playerlist.update-latency",
+    "global-playerlist.spy-servers",
+    "global-playerlist.server-groups.*",
     "use-bukkit-permissions-manager",
     "use-online-uuid-in-tablist",
     // groups.yml and users.yml (properties.rs, VALID_PROPERTIES)
@@ -442,6 +461,8 @@ impl Config {
             mysql: MysqlConfig::from_yaml(y.get("mysql")),
             unsupported: Vec::new(),
             per_world: None,
+            global: None,
+            proxy_support: None,
             layout: None,
             config_warnings: Vec::new(),
             proxy_only_on: Vec::new(),
@@ -465,6 +486,28 @@ impl Config {
             let mut w = Vec::new();
             cfg.per_world = Some(crate::horizon_tab::perworld::PerWorld::from_yaml(y.get("per-world-playerlist"), &mut w));
             cfg.config_warnings.extend(w);
+        }
+        if y.at(&["global-playerlist", "enabled"]).bool_or(false) {
+            let mut w = Vec::new();
+            cfg.global = Some(crate::horizon_tab::proxy::GlobalCfg::from_yaml(y.get("global-playerlist"), &mut w));
+            cfg.config_warnings.extend(w);
+        }
+        if y.at(&["proxy-support", "enabled"]).bool_or(false) {
+            let ps = y.get("proxy-support");
+            let kind = ps.get("type").str_or("PLUGIN").to_ascii_uppercase();
+            let kind = if ["PLUGIN", "REDIS", "RABBITMQ"].contains(&kind.as_str()) {
+                kind
+            } else {
+                cfg.config_warnings.push(format!(
+                    "Proxy support type \"{kind}\" is not supported. Supported types are: PLUGIN, REDIS, RABBITMQ. Defaulting to PLUGIN."
+                ));
+                "PLUGIN".to_owned()
+            };
+            cfg.proxy_support = Some(ProxySupportCfg {
+                kind,
+                channel: crate::horizon_tab::proxy::channel_name(&ps.get("channel-name-suffix").str_or("custom")),
+                plugin_name: ps.at(&["plugin", "name"]).str_or("RedisBungee"),
+            });
         }
         cfg
     }
@@ -524,12 +567,26 @@ mod tests {
         let y = crate::horizon_tab::yaml::parse("proxy-support:\n  enabled: true\nuse-online-uuid-in-tablist: false\nuse-bukkit-permissions-manager: true\n")
             .unwrap();
         let c = Config::from_yaml(&y);
-        assert_eq!(c.proxy_only_on, vec!["proxy-support.enabled", "use-bukkit-permissions-manager"]);
+        assert_eq!(c.proxy_only_on, vec!["use-bukkit-permissions-manager"]);
         // Inert on a backend: no "not implemented" warning.
         assert!(c.unsupported.is_empty());
-        // The shipped test config reads the same keys (proxy-support on there).
+        // The shipped test config has proxy-support on: it is read and used, not ignored.
         let c = Config::from_yaml(&crate::horizon_tab::yaml::parse(include_str!("../../data/tab/testdata/config.yml")).unwrap());
-        assert!(c.proxy_only_on.contains(&"proxy-support.enabled".to_owned()));
+        let ps = c.proxy_support.expect("proxy-support is on in the test config");
+        assert_eq!((ps.kind.as_str(), ps.channel.as_str(), ps.plugin_name.as_str()), ("PLUGIN", "TAB_4_custom", "RedisBungee"));
+        assert!(c.global.is_none(), "global-playerlist is off there");
         assert!(c.unsupported.iter().all(|u| u != "proxy-support"));
+    }
+
+    #[test]
+    fn global_playerlist_and_proxy_support_are_read() {
+        let y = crate::horizon_tab::yaml::parse(
+            "global-playerlist:\n  enabled: true\n  isolate-unlisted-servers: true\nproxy-support:\n  enabled: true\n  type: nonsense\n  channel-name-suffix: net\n",
+        )
+        .unwrap();
+        let c = Config::from_yaml(&y);
+        assert!(c.global.as_ref().is_some_and(|g| g.isolate_unlisted));
+        assert_eq!(c.proxy_support.as_ref().map(|p| (p.kind.as_str(), p.channel.as_str())), Some(("PLUGIN", "TAB_4_net")));
+        assert!(c.config_warnings.iter().any(|w| w.contains("\"NONSENSE\" is not supported")));
     }
 }

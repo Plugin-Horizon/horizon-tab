@@ -404,10 +404,16 @@ pub fn build_dump(e: &mut Engine, i: usize) -> String {
         ("PingSpoof", c.ping_spoof.is_some()),
         ("Layout", c.layout.is_some()),
         ("PerWorldPlayerList", c.per_world.is_some()),
+        ("GlobalPlayerList", c.global.is_some()),
+        ("ProxySupport", c.proxy_support.is_some()),
     ] {
         s.push_str(&format!("  {name}: {}\n", on(enabled)));
     }
-    s.push_str("  GlobalPlayerList: proxy-only, inert on a backend\n");
+    s.push_str(&format!(
+        "proxy:\n  players of other TAB instances: {}\n  bridge links (tab:bridge-6): {}\n",
+        e.proxy.players.len(),
+        e.bridge.players.len()
+    ));
     s.push_str("minimessage:\n");
     s.push_str(&format!("  support is enabled in config: {}\n", c.minimessage));
     s.push_str("  MiniMessage module: built in (colours, decorations, gradients, rainbow, transition, click, hover, font, insertion, key, lang, selector, score, nbt)\n");
@@ -1299,5 +1305,23 @@ mod tests {
         // Already hidden: nothing happens.
         let o = tab(&mut e, Sender::Console, "nametag hideview Steve");
         assert!(o.packets.is_empty());
+    }
+
+    #[test]
+    fn a_help_menu_with_click_and_hover_reaches_the_player_as_components() {
+        let mut e = engine();
+        e.messages = yaml::parse(
+            "help-menu:\n  - '<click:run_command:/tab reload><hover:show_text:''<red>Reloads the plugin''>/tab reload</hover></click>'\n  - '&7plain line'\n",
+        )
+        .unwrap();
+        let o = tab(&mut e, Sender::Console, "help");
+        // The version line, then one reply per help-menu line.
+        assert_eq!(o.replies.len(), 3, "{:?}", o.replies);
+        let c = crate::horizon_tab::text::component(&o.replies[1], e.cfg.minimessage);
+        assert_eq!(c["click_event"], serde_json::json!({ "action": "run_command", "command": "/tab reload" }));
+        assert_eq!(c["hover_event"]["action"], "show_text");
+        assert_eq!(c["hover_event"]["value"]["text"], "Reloads the plugin");
+        let plain = crate::horizon_tab::text::component(&o.replies[2], e.cfg.minimessage);
+        assert!(plain.get("click_event").is_none());
     }
 }

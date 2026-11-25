@@ -7,6 +7,7 @@
 //! `messages.yml`, `playerdata.yml`), so a server's `plugins/TAB/` folder works as it is.
 
 pub mod api;
+pub mod bridge;
 pub mod commands;
 pub mod conditions;
 pub mod cpu;
@@ -23,6 +24,7 @@ pub mod out;
 pub mod perworld;
 pub mod placeholders;
 pub mod properties;
+pub mod proxy;
 pub mod sorting;
 pub mod tabph;
 pub mod text;

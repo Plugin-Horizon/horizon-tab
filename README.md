@@ -2,7 +2,7 @@
 
 ## Port status
 
-Item list: audit/rec100/tab.md (round 4, 2026-11-25: 40 of 44 items work, 4 are n/a with a reason, nothing is open; the code is written against the combined next SDK and was not compiled yet). Earlier estimates below are superseded.
+Item list: audit/rec100/tab.md (round 5, 2026-11-25: 41 of 44 items work, 2 are built up to the transport (engine), 1 is n/a (removed); nothing is open; the code is written against the combined next SDK and was not compiled yet). Earlier estimates below are superseded.
 
 > **Unofficial Rust port of TAB for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the TAB authors.**
 
@@ -93,7 +93,7 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 Round 4 (2026-11-25) closed the list of open items; what stays out, and why:
 
-- `global-playerlist`, `%online_<server>%` of other servers and `proxy-support`: TAB gets other servers' players only from its own plugin on the proxy (`tab:proxy` messages). No TAB runs on Velocity here, and one backend knows only its own players (the own-server count works). The keys are read and ignored.
+- `proxy-support`, `global-playerlist`, `%online_<server>%` and the `tab:bridge-6` bridge (round 5): the logic is in the mod and tested (`proxy.rs`: TAB's ProxySupport messages, the remote-player directory, server groups and `shouldSee`; `bridge.rs` and `Engine::bridge_*`: the backend half of the proxy bridge). The transport is not: the host has no raw plugin-message channel and no broker client, so no message reaches or leaves the mod yet (`api::proxy_message`, `api::proxy_outbox`, `api::bridge_message`, `api::bridge_outbox` are the seam; ENGINE_NEEDS `plugin_message_channel`, `proxy_support_transport`). Until then the counts and the list know only this server's players.
 - Unlimited name tags (armor stands): removed from TAB before 6.2.2 (its LegacyConverter deletes the option); nothing to port.
 - `/tab dump` writes a local file; the upload to a paste service is not done (the dump holds player names, ids and the config).
 - The help menu has no hover or click events in TAB 6.2.2; a `help-menu` in `messages.yml` that uses `<click>` or `<hover>` works through the MiniMessage module.

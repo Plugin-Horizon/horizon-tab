@@ -324,6 +324,36 @@ pub fn tick(now_ms: i64, server: Server, players: Vec<PlayerIn>) -> Vec<Packet> 
     packets
 }
 
+/// One `proxy-support` message (Base64) a transport received from the channel [`proxy_channel`] names.
+pub fn proxy_message(raw: &str) {
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = guard.as_mut() {
+        s.engine.proxy_receive(raw);
+    }
+}
+
+/// The `proxy-support` channel and the messages to send on it (None: the feature is off).
+pub fn proxy_outbox() -> Option<(String, Vec<String>)> {
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_mut()?.engine.proxy_outbox()
+}
+
+/// One `tab:bridge-6` message from TAB on the proxy for a player's connection. Scoreboard messages
+/// answer with packets (sent with the next tick's); the answers wait in [`bridge_outbox`].
+pub fn bridge_message(player: u128, bytes: &[u8]) {
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = guard.as_mut() {
+        let packets = s.engine.bridge_receive(player, bytes);
+        s.pending.extend(packets);
+    }
+}
+
+/// The `(player, bytes)` answers for the proxy's TAB, to send on `tab:bridge-6`.
+pub fn bridge_outbox() -> Vec<(u128, Vec<u8>)> {
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_mut().map(|s| s.engine.bridge_outbox()).unwrap_or_default()
+}
+
 /// The display name for the game's own player info entry of `uuid`, when TAB formats it.
 pub fn list_name(uuid: u128) -> Option<Value> {
     list_names()

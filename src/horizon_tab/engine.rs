@@ -8,7 +8,9 @@
 //! objective, the sidebar scoreboard, boss bars, spectator fix and ping spoof. How each one
 //! behaves follows TAB's feature classes (Apache-2.0, see NOTICE).
 
+use crate::horizon_tab::bridge::{Bridge, BridgePlayer, FromProxy, PlaceholderValue, ToProxy};
 use crate::horizon_tab::config::{Board, Config};
+use crate::horizon_tab::proxy::ProxyState;
 use crate::horizon_tab::integration;
 use crate::horizon_tab::mysql;
 use crate::horizon_tab::out::{ListEntry, BossOut, NumberFmt, ObjectiveMethod, Out, Packet, TeamParams};
@@ -111,6 +113,8 @@ struct Sent {
     /// Players hidden from this viewer by the per-world playerlist.
     pw_hidden: HashSet<u128>,
     layout: Option<LayoutSent>,
+    /// Remote players the global playerlist added (tab list id -> what was sent).
+    global: HashMap<u128, String>,
 }
 
 /// What a viewer's client holds of the layout.
@@ -203,6 +207,10 @@ pub struct Engine {
     entry_names: HashMap<u128, String>,
     /// (viewer, target) pairs whose name tag the opaque mode hides: no line of sight.
     occluded: HashSet<(u128, u128)>,
+    /// `proxy-support`: the players of other TAB instances and the messages for them.
+    pub proxy: ProxyState,
+    /// The backend half of TAB's proxy bridge.
+    pub bridge: Bridge,
 }
 
 fn read_yaml(path: &Path, warnings: &mut Vec<String>) -> Yaml {
@@ -346,7 +354,15 @@ impl Engine {
             skins: HashMap::new(),
             entry_names: HashMap::new(),
             occluded: HashSet::new(),
+            proxy: ProxyState::new(new_instance_id()),
+            bridge: Bridge::default(),
         }
+        .with_proxy_flag()
+    }
+
+    fn with_proxy_flag(mut self) -> Engine {
+        self.proxy.enabled = self.cfg.proxy_support.is_some();
+        self
     }
 
     pub fn now_ms(&self) -> i64 {
@@ -429,9 +445,15 @@ impl Engine {
         self.cpu.start_lap();
         self.sync_players(&server, inputs, &mut out);
         self.cpu.lap("Player tracking", "Joining, leaving and updating players");
+        server.proxy_players = self.proxy.brief();
+        server.global = self.cfg.global.clone();
         let snapshot: Vec<Player> = self.players.iter().map(|p| p.tp.p.clone()).collect();
         placeholders::update_snapshot(server.clone(), snapshot);
         self.server = server;
+        if self.proxy.enabled {
+            let local = self.proxy_local();
+            self.proxy.sync_local(&local);
+        }
         self.announced_bars.retain(|(_, until)| *until > now_ms);
         if self.announced_board.as_ref().is_some_and(|(_, until)| *until <= now_ms) {
             self.announced_board = None;
@@ -441,6 +463,8 @@ impl Engine {
         let all: Vec<TabPlayer> = self.players.iter().map(|p| p.tp.clone()).collect();
         let targets: Vec<TargetTexts> = (0..all.len()).map(|i| self.target_texts(i, &all)).collect();
         self.cpu.lap("Placeholders", "Parsing player texts");
+        self.bridge_tick(&all);
+        self.cpu.lap("Bridge", "Answering the proxy");
         for vi in 0..self.players.len() {
             // A fake player has no client: its view of the list would be built for no one.
             if self.players[vi].fake {
@@ -1254,6 +1278,8 @@ impl Engine {
         self.cpu.lap("Layout", "Updating");
         self.per_world_for(vi, all, &mut sent, out);
         self.cpu.lap("Per world playerlist", "Updating");
+        self.global_for(vi, all, &mut sent, out);
+        self.cpu.lap("Global playerlist", "Updating");
         self.players[vi].sent = sent;
     }
 
@@ -1694,6 +1720,11 @@ impl Engine {
                     out.push(Packet { to, out: Out::Listed { ids: real, listed: true } });
                 }
             }
+            if !s.global.is_empty() {
+                let mut ids: Vec<u128> = s.global.keys().copied().collect();
+                ids.sort_unstable();
+                out.push(Packet { to, out: Out::ListRemove(ids) });
+            }
             let back: Vec<u128> = s.pw_hidden.iter().copied().filter(|u| online.contains(u)).collect();
             if !back.is_empty() {
                 out.push(Packet {
@@ -1770,6 +1801,13 @@ impl Engine {
         fresh.players = std::mem::take(&mut self.players);
         fresh.now_ms = self.now_ms;
         fresh.server = self.server.clone();
+        fresh.bridge = std::mem::take(&mut self.bridge);
+        let mut proxy = std::mem::take(&mut self.proxy);
+        proxy.enabled = fresh.cfg.proxy_support.is_some();
+        if !proxy.enabled {
+            proxy.clear();
+        }
+        fresh.proxy = proxy;
         let online: Vec<(String, u128)> = fresh
             .players
             .iter()
@@ -1989,6 +2027,404 @@ impl Engine {
 
     pub(crate) fn bossbar_shown(&self, i: usize) -> bool {
         self.players[i].bossbar_toggled == self.cfg.bossbar.hidden_by_default
+    }
+}
+
+// ---- proxy support, global playerlist and the proxy bridge -----------------------------------------
+
+/// A fresh instance id for `ProxySupport` (TAB uses a random UUID per start).
+fn new_instance_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(1);
+    uuid_string(nanos ^ ((std::process::id() as u128) << 96) ^ 0x5441_4250_524f_5859)
+}
+
+fn visibility_code(s: &str) -> i32 {
+    match s {
+        "never" => 1,
+        "hideForOtherTeams" => 2,
+        "hideForOwnTeam" => 3,
+        _ => 0,
+    }
+}
+
+fn collision_code(s: &str) -> i32 {
+    match s {
+        "never" => 1,
+        "pushOtherTeams" => 2,
+        "pushOwnTeam" => 3,
+        _ => 0,
+    }
+}
+
+impl Engine {
+    /// The local players as the other instances are told about them.
+    pub fn proxy_local(&self) -> Vec<crate::horizon_tab::proxy::PlayerData> {
+        self.players
+            .iter()
+            .filter(|p| !p.fake)
+            .map(|p| crate::horizon_tab::proxy::PlayerData {
+                unique_id: p.tp.p.uuid,
+                tablist_id: p.tp.p.uuid,
+                name: p.tp.p.name.clone(),
+                server: self.server.level_name.clone(),
+                vanished: p.tp.p.vanished,
+                staff: integration::permission(p.tp.p.uuid, "tab.staff", p.tp.p.op_level),
+                skin: self
+                    .skins
+                    .get(&p.tp.p.uuid)
+                    .map(|(v, s)| (v.clone(), if s.is_empty() { None } else { Some(s.clone()) })),
+            })
+            .collect()
+    }
+
+    /// One `proxy-support` message from the transport (a Base64 string).
+    pub fn proxy_receive(&mut self, raw: &str) {
+        let local = self.proxy_local();
+        self.proxy.receive(raw, &local);
+    }
+
+    /// The `proxy-support` messages to send, with the channel they go to (None: feature off).
+    pub fn proxy_outbox(&mut self) -> Option<(String, Vec<String>)> {
+        let channel = self.cfg.proxy_support.as_ref()?.channel.clone();
+        Some((channel, self.proxy.take_outbox()))
+    }
+
+    /// The remote players the viewer's list shows (`GlobalPlayerList.shouldSee`).
+    fn global_wanted(&self, vi: usize, all: &[TabPlayer]) -> std::collections::BTreeMap<u128, (String, ListEntry)> {
+        use crate::horizon_tab::proxy::remote_visible;
+        let mut wanted = std::collections::BTreeMap::new();
+        let Some(g) = &self.cfg.global else { return wanted };
+        let me = &all[vi];
+        let sees_vanished = integration::permission(me.p.uuid, "tab.seevanished", me.p.op_level);
+        for rp in self.proxy.players.values() {
+            let connected = all.iter().any(|t| t.p.uuid == rp.unique_id || t.p.uuid == rp.tablist_id);
+            // Players of this very server are listed by the game itself.
+            if rp.server == self.server.level_name
+                || !remote_visible(g, &self.server.level_name, sees_vanished, rp, connected)
+            {
+                continue;
+            }
+            let skin = rp.skin.as_ref().map(|(v, s)| (v.clone(), s.clone().unwrap_or_default()));
+            let sig = format!("{}|{:?}", rp.nickname, skin);
+            wanted.insert(
+                rp.tablist_id,
+                (
+                    sig,
+                    ListEntry {
+                        uuid: rp.tablist_id,
+                        skin,
+                        latency: 0,
+                        display: self.component(&rp.nickname),
+                        order: 0,
+                    },
+                ),
+            );
+        }
+        wanted
+    }
+
+    /// `global-playerlist`: the players of other servers in this viewer's list, kept in step.
+    fn global_for(&self, vi: usize, all: &[TabPlayer], sent: &mut Sent, out: &mut Vec<Packet>) {
+        let to = all[vi].p.uuid;
+        // A layout owns the list; the remote players wait for it to go.
+        let wanted = if sent.layout.is_some() { Default::default() } else { self.global_wanted(vi, all) };
+        let mut removes: Vec<u128> = sent
+            .global
+            .iter()
+            .filter(|(id, sig)| wanted.get(*id).is_none_or(|(w, _)| w != *sig))
+            .map(|(id, _)| *id)
+            .collect();
+        removes.sort_unstable();
+        let adds: Vec<ListEntry> = wanted
+            .iter()
+            .filter(|(id, (sig, _))| sent.global.get(*id) != Some(sig))
+            .map(|(_, (_, e))| e.clone())
+            .collect();
+        for id in &removes {
+            sent.global.remove(id);
+        }
+        for (id, (sig, _)) in &wanted {
+            sent.global.insert(*id, sig.clone());
+        }
+        if !removes.is_empty() {
+            out.push(Packet { to, out: Out::ListRemove(removes) });
+        }
+        if !adds.is_empty() {
+            out.push(Packet { to, out: Out::ListAdd(adds) });
+        }
+    }
+
+    // ---- the bridge ---------------------------------------------------------------------------------
+
+    /// A component from a string the proxy sent: JSON as it is, anything else as TAB-formatted text.
+    fn bridge_component(&self, s: &str) -> Value {
+        let t = s.trim();
+        if t.starts_with(['{', '[', '"']) {
+            if let Ok(v) = serde_json::from_str::<Value>(t) {
+                return v;
+            }
+        }
+        self.component(s)
+    }
+
+    fn bridge_number_format(&self, f: &Option<String>) -> Option<NumberFmt> {
+        match f.as_deref() {
+            None | Some("") => None,
+            Some("blank") => Some(NumberFmt::Blank),
+            Some(other) => Some(NumberFmt::Fixed(self.bridge_component(other))),
+        }
+    }
+
+    /// One placeholder's value for a player, with the proxy's output replacements.
+    fn bridge_value(&self, ident: &str, all: &[TabPlayer], target: usize, viewer: usize, bp: &BridgePlayer) -> Option<String> {
+        let ctx = self.ctx(all, target, viewer);
+        let v = self.ph.parse_with_rules(ident, &ctx, &bp.replacements);
+        // An identifier nothing here answers stays as written: the proxy keeps its own value.
+        (v != ident).then_some(v)
+    }
+
+    /// The answers a join gives: world, group, every placeholder, game mode.
+    fn bridge_join_response(&self, all: &[TabPlayer], vi: usize, bp: &mut BridgePlayer) -> ToProxy {
+        let me = &all[vi];
+        let mut values = Vec::new();
+        for (ident, _) in bp.placeholders.clone() {
+            if crate::horizon_tab::bridge::is_relational(&ident) {
+                let mut rows = Vec::new();
+                for (ti, other) in all.iter().enumerate() {
+                    if ti == vi {
+                        continue;
+                    }
+                    if let Some(v) = self.bridge_value(&ident, all, ti, vi, bp) {
+                        bp.sent.insert(format!("{ident}\u{0}{}", other.p.name), v.clone());
+                        rows.push((other.p.name.clone(), v));
+                    }
+                }
+                values.push((ident, PlaceholderValue::Relational(rows)));
+            } else if let Some(v) = self.bridge_value(&ident, all, vi, vi, bp) {
+                bp.sent.insert(ident.clone(), v.clone());
+                values.push((ident, PlaceholderValue::Plain(v)));
+            }
+        }
+        bp.world = Some(me.p.world.clone());
+        bp.game_mode = Some(me.p.game_mode);
+        bp.group = Some(me.group.clone());
+        ToProxy::PlayerJoinResponse {
+            world: me.p.world.clone(),
+            group: bp.forward_group.then(|| me.group.clone()),
+            values,
+            game_mode: me.p.game_mode,
+        }
+    }
+
+    /// One message from TAB on the proxy, for a player's connection. Scoreboard messages come back as
+    /// packets for that player; answers wait in `bridge_outbox`.
+    pub fn bridge_receive(&mut self, player: u128, bytes: &[u8]) -> Vec<Packet> {
+        let msg = match crate::horizon_tab::bridge::decode_from_proxy(bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                self.bridge.problems.push(e);
+                return Vec::new();
+            }
+        };
+        let Some(vi) = self.index_of(player) else { return Vec::new() };
+        let all = self.all_players();
+        let me = all[vi].clone();
+        let mut out = Vec::new();
+        let mut push = |o: Out| out.push(Packet { to: player, out: o });
+        match msg {
+            FromProxy::PlayerJoin { forward_group, placeholders, replacements } => {
+                let mut bp = BridgePlayer { forward_group, placeholders, replacements, ..BridgePlayer::default() };
+                let response = self.bridge_join_response(&all, vi, &mut bp);
+                // The new server starts from "not vanished, visible": say so only when it is not.
+                bp.vanished = Some(me.p.vanished);
+                bp.invisible = Some(me.p.invisible);
+                self.bridge.players.insert(player, bp);
+                self.bridge.send(player, &response);
+                if me.p.vanished {
+                    self.bridge.send(player, &ToProxy::Vanished(true));
+                }
+                if me.p.invisible {
+                    self.bridge.send(player, &ToProxy::Invisible(true));
+                }
+            }
+            FromProxy::Permission(node) => {
+                let value = integration::permission(player, &node, me.p.op_level);
+                if let Some(bp) = self.bridge.players.get_mut(&player) {
+                    bp.permissions.insert(node.clone(), value);
+                }
+                self.bridge.send(player, &ToProxy::HasPermission { permission: node, value });
+            }
+            FromProxy::Expansion { placeholder, value } => {
+                if let Some(bp) = self.bridge.players.get_mut(&player) {
+                    bp.expansion.insert(placeholder, value);
+                }
+            }
+            FromProxy::Placeholder { identifier, refresh } => {
+                if let Some(bp) = self.bridge.players.get_mut(&player) {
+                    bp.placeholders.retain(|(i, _)| *i != identifier);
+                    bp.placeholders.push((identifier, refresh));
+                }
+            }
+            FromProxy::Unload => {
+                if let Some(bp) = self.bridge.players.remove(&player) {
+                    for t in bp.teams {
+                        push(Out::TeamRemove { name: t });
+                    }
+                    for o in bp.objectives {
+                        push(Out::Objective {
+                            name: o,
+                            method: ObjectiveMethod::Remove,
+                            title: json!({"text": ""}),
+                            hearts: false,
+                            format: None,
+                        });
+                    }
+                }
+            }
+            FromProxy::DisplayObjective { slot, objective } => push(Out::DisplaySlot { slot, objective }),
+            FromProxy::Objective { name, action, title, display, number_format } => {
+                let bp = self.bridge.players.entry(player).or_default();
+                let method = match action {
+                    0 => {
+                        if !bp.objectives.contains(&name) {
+                            bp.objectives.push(name.clone());
+                        }
+                        ObjectiveMethod::Add
+                    }
+                    1 => {
+                        bp.objectives.retain(|o| *o != name);
+                        ObjectiveMethod::Remove
+                    }
+                    _ => ObjectiveMethod::Change,
+                };
+                let (title, format) = if action == 1 {
+                    (json!({"text": ""}), None)
+                } else {
+                    (self.bridge_component(&title), self.bridge_number_format(&number_format))
+                };
+                push(Out::Objective { name, method, title, hearts: display == 1, format });
+            }
+            FromProxy::Score { objective, action, holder, score, display_name, number_format } => {
+                if action == 0 {
+                    push(Out::Score {
+                        owner: holder,
+                        objective,
+                        score,
+                        display: display_name.as_deref().map(|d| self.bridge_component(d)),
+                        format: self.bridge_number_format(&number_format),
+                    });
+                } else {
+                    push(Out::ResetScore { owner: holder, objective });
+                }
+            }
+            FromProxy::Team { name, action, prefix, suffix, options, visibility, collision, color, players } => {
+                if action == 1 {
+                    if let Some(bp) = self.bridge.players.get_mut(&player) {
+                        bp.teams.retain(|t| *t != name);
+                    }
+                    push(Out::TeamRemove { name });
+                } else {
+                    let params = TeamParams {
+                        display_name: json!({"text": name}),
+                        prefix: self.bridge_component(&prefix),
+                        suffix: self.bridge_component(&suffix),
+                        visibility: visibility_code(&visibility),
+                        collision: collision_code(&collision),
+                        color: (0..=15).contains(&color).then_some(color),
+                        options: options as i8,
+                    };
+                    if action == 0 {
+                        let bp = self.bridge.players.entry(player).or_default();
+                        if !bp.teams.contains(&name) {
+                            bp.teams.push(name.clone());
+                        }
+                        push(Out::TeamCreate { name, params, players });
+                    } else {
+                        push(Out::TeamUpdate { name, params });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The bridge answers waiting for the transport: `(player, bytes)` for channel `tab:bridge-6`.
+    pub fn bridge_outbox(&mut self) -> Vec<(u128, Vec<u8>)> {
+        self.bridge.take_outbox()
+    }
+
+    /// What changed for bridged players since the last tick: world, game mode, group, vanish,
+    /// invisibility and the proxy's placeholders at their refresh intervals.
+    fn bridge_tick(&mut self, all: &[TabPlayer]) {
+        if self.bridge.players.is_empty() {
+            return;
+        }
+        self.bridge.players.retain(|u, _| all.iter().any(|t| t.p.uuid == *u));
+        let now = self.now_ms;
+        let ids: Vec<u128> = self.bridge.players.keys().copied().collect();
+        for uuid in ids {
+            let Some(vi) = all.iter().position(|t| t.p.uuid == uuid) else { continue };
+            let me = &all[vi];
+            let mut bp = self.bridge.players[&uuid].clone();
+            let mut msgs: Vec<ToProxy> = Vec::new();
+            if bp.world.as_deref() != Some(me.p.world.as_str()) {
+                msgs.push(ToProxy::SetWorld(me.p.world.clone()));
+                bp.world = Some(me.p.world.clone());
+            }
+            if bp.game_mode != Some(me.p.game_mode) {
+                msgs.push(ToProxy::UpdateGameMode(me.p.game_mode));
+                bp.game_mode = Some(me.p.game_mode);
+            }
+            if bp.forward_group && bp.group.as_deref() != Some(me.group.as_str()) {
+                msgs.push(ToProxy::SetGroup(me.group.clone()));
+                bp.group = Some(me.group.clone());
+            }
+            if bp.vanished != Some(me.p.vanished) {
+                msgs.push(ToProxy::Vanished(me.p.vanished));
+                bp.vanished = Some(me.p.vanished);
+            }
+            if bp.invisible != Some(me.p.invisible) {
+                msgs.push(ToProxy::Invisible(me.p.invisible));
+                bp.invisible = Some(me.p.invisible);
+            }
+            for (ident, refresh) in bp.placeholders.clone() {
+                let due = bp.last_eval.get(&ident).is_none_or(|t| now - *t >= i64::from(refresh).max(50));
+                if !due {
+                    continue;
+                }
+                bp.last_eval.insert(ident.clone(), now);
+                if crate::horizon_tab::bridge::is_relational(&ident) {
+                    for (ti, other) in all.iter().enumerate() {
+                        if ti == vi {
+                            continue;
+                        }
+                        if let Some(v) = self.bridge_value(&ident, all, ti, vi, &bp) {
+                            let key = format!("{ident}\u{0}{}", other.p.name);
+                            if bp.sent.get(&key) != Some(&v) {
+                                bp.sent.insert(key, v.clone());
+                                msgs.push(ToProxy::UpdatePlaceholder {
+                                    identifier: ident.clone(),
+                                    target: Some(other.p.name.clone()),
+                                    value: v,
+                                });
+                            }
+                        }
+                    }
+                } else if let Some(v) = self.bridge_value(&ident, all, vi, vi, &bp) {
+                    if bp.sent.get(&ident) != Some(&v) {
+                        bp.sent.insert(ident.clone(), v.clone());
+                        msgs.push(ToProxy::UpdatePlaceholder { identifier: ident, target: None, value: v });
+                    }
+                }
+            }
+            self.bridge.players.insert(uuid, bp);
+            for m in msgs {
+                self.bridge.send(uuid, &m);
+            }
+        }
     }
 }
 
@@ -2456,5 +2892,167 @@ mod tests {
         assert_eq!(created.len(), 1, "{packets:?}");
         // The old name comes back when the plugin restores it.
         assert!(e.set_entry_name(1, 1, "Steve"));
+    }
+
+    // ---- proxy support, global playerlist, the bridge -----------------------------------------------
+
+    const GLOBAL: &str = "global-playerlist:\n  enabled: true\n  server-groups:\n    g:\n      - world\n      - lobby\nproxy-support:\n  enabled: true\n  channel-name-suffix: net\n";
+
+    fn remote(id: u128, name: &str, server: &str, vanished: bool) -> crate::horizon_tab::proxy::PlayerData {
+        crate::horizon_tab::proxy::PlayerData {
+            unique_id: id,
+            tablist_id: id,
+            name: name.into(),
+            server: server.into(),
+            vanished,
+            staff: true,
+            skin: Some(("V".into(), Some("S".into()))),
+        }
+    }
+
+    fn tell(e: &mut Engine, m: crate::horizon_tab::proxy::ProxyMsg) {
+        e.proxy_receive(&crate::horizon_tab::proxy::encode("other", &m));
+    }
+
+    #[test]
+    fn remote_players_join_the_global_list_and_the_counts() {
+        use crate::horizon_tab::proxy::ProxyMsg;
+        let mut e = engine(GLOBAL, "");
+        let first = e.tick(1000, server(), vec![player("Steve", 1)]);
+        assert!(for_whom(&first, 1).iter().all(|o| !matches!(o, Out::ListAdd(_))));
+        assert_eq!(e.proxy_outbox().map(|(c, m)| (c, m.len())), Some(("TAB_4_net".to_owned(), 2)), "a load request and our join");
+        tell(&mut e, ProxyMsg::PlayerJoin(remote(50, "Far", "lobby", false)));
+        tell(&mut e, ProxyMsg::PlayerJoin(remote(51, "Other", "elsewhere", false)));
+        let packets = e.tick(3000, server(), vec![player("Steve", 1)]);
+        let adds: Vec<_> = for_whom(&packets, 1)
+            .into_iter()
+            .filter_map(|o| if let Out::ListAdd(a) = o { Some(a.clone()) } else { None })
+            .collect();
+        // "elsewhere" is not in the viewer's group, "lobby" is.
+        assert_eq!(adds.len(), 1, "{packets:?}");
+        assert_eq!(adds[0].iter().map(|x| x.uuid).collect::<Vec<_>>(), vec![50]);
+        assert_eq!(adds[0][0].skin, Some(("V".to_owned(), "S".to_owned())));
+        assert_eq!(adds[0][0].display["text"], "Far");
+        // Counts: two remote players plus Steve; one on "lobby".
+        assert_eq!(e.parse_for(0, "%online%"), "3");
+        assert_eq!(e.parse_for(0, "%online_lobby%"), "1");
+        assert_eq!(e.parse_for(0, "%online_world%"), "1");
+        assert_eq!(e.parse_for(0, "%staffonline%"), "2", "Steve is not staff, both remote players are");
+        assert_eq!(e.parse_for(0, "%playerlist-group_g%"), "2", "Steve and Far are in the group");
+        // Nothing is sent again while nothing changes.
+        let again = e.tick(5000, server(), vec![player("Steve", 1)]);
+        assert!(for_whom(&again, 1).iter().all(|o| !matches!(o, Out::ListAdd(_) | Out::ListRemove(_))));
+        // A vanished player leaves the list for a viewer without tab.seevanished.
+        tell(&mut e, ProxyMsg::UpdateVanishStatus(50, true));
+        let packets = e.tick(7000, server(), vec![player("Steve", 1)]);
+        assert!(for_whom(&packets, 1).iter().any(|o| matches!(o, Out::ListRemove(ids) if ids == &vec![50])));
+        assert_eq!(e.parse_for(0, "%online_lobby%"), "0");
+        assert_eq!(e.parse_for(0, "%online%"), "2", "Steve and the player on the other server");
+        // That player quits.
+        tell(&mut e, ProxyMsg::PlayerQuit(51));
+        let _ = e.tick(9000, server(), vec![player("Steve", 1)]);
+        assert_eq!(e.parse_for(0, "%online%"), "1");
+    }
+
+    #[test]
+    fn unloading_takes_the_remote_entries_away() {
+        use crate::horizon_tab::proxy::ProxyMsg;
+        let mut e = engine(GLOBAL, "");
+        tell(&mut e, ProxyMsg::PlayerJoin(remote(50, "Far", "lobby", false)));
+        let _ = e.tick(1000, server(), vec![player("Steve", 1)]);
+        let out = e.unload();
+        assert!(for_whom(&out, 1).iter().any(|o| matches!(o, Out::ListRemove(ids) if ids == &vec![50])));
+    }
+
+    fn bridge_answers(e: &mut Engine) -> Vec<crate::horizon_tab::bridge::ToProxy> {
+        e.bridge_outbox()
+            .into_iter()
+            .map(|(_, b)| crate::horizon_tab::bridge::decode_to_proxy(&b, false).unwrap_or_else(|_| crate::horizon_tab::bridge::decode_to_proxy(&b, true).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn the_bridge_answers_a_join_and_follows_the_player() {
+        use crate::horizon_tab::bridge::{encode_from_proxy, FromProxy, PlaceholderValue, ToProxy};
+        let mut e = engine("", "");
+        let _ = e.tick(1000, server(), vec![player("Steve", 1)]);
+        let join = FromProxy::PlayerJoin {
+            forward_group: false,
+            placeholders: vec![("%player%".into(), 1000), ("%ping%".into(), 100), ("%nothing_known%".into(), 100)],
+            replacements: vec![("%player%".into(), vec![("Steve".into(), "\u{a7}bSteve!".into())])],
+        };
+        assert!(e.bridge_receive(1, &encode_from_proxy(&join)).is_empty());
+        let answers = bridge_answers(&mut e);
+        let ToProxy::PlayerJoinResponse { world, group, values, game_mode } = &answers[0] else { panic!("{answers:?}") };
+        assert_eq!((world.as_str(), group.as_ref(), *game_mode), ("world", None, 0));
+        // The proxy's replacement applies, the ping is this server's, the unknown one is left to the proxy.
+        assert_eq!(values.len(), 2, "{values:?}");
+        assert_eq!(values[0], ("%player%".to_owned(), PlaceholderValue::Plain("\u{a7}bSteve!".to_owned())));
+        assert_eq!(values[1], ("%ping%".to_owned(), PlaceholderValue::Plain("25".to_owned())));
+        // Nothing changed: nothing is sent. A new ping and a world change are.
+        let _ = e.tick(1100, server(), vec![player("Steve", 1)]);
+        assert!(bridge_answers(&mut e).is_empty(), "nothing changed");
+        let mut moved = player("Steve", 1);
+        moved.dimension = "minecraft:the_nether".into();
+        moved.ping = 80;
+        moved.game_mode = 1;
+        let _ = e.tick(1700, server(), vec![moved]);
+        let answers = bridge_answers(&mut e);
+        assert!(answers.contains(&ToProxy::SetWorld("world_nether".into())), "{answers:?}");
+        assert!(answers.contains(&ToProxy::UpdateGameMode(1)), "{answers:?}");
+        assert!(answers.contains(&ToProxy::UpdatePlaceholder { identifier: "%ping%".into(), target: None, value: "80".into() }), "{answers:?}");
+    }
+
+    #[test]
+    fn the_bridge_answers_permission_questions_and_builds_scoreboards() {
+        use crate::horizon_tab::bridge::{encode_from_proxy, FromProxy, ToProxy};
+        let mut e = engine("", "");
+        let _ = e.tick(1000, server(), vec![player("Steve", 1)]);
+        let send = |e: &mut Engine, m: FromProxy| e.bridge_receive(1, &encode_from_proxy(&m));
+        send(&mut e, FromProxy::PlayerJoin { forward_group: true, placeholders: vec![], replacements: vec![] });
+        let answers = bridge_answers(&mut e);
+        assert!(matches!(&answers[0], ToProxy::PlayerJoinResponse { group: Some(_), .. }), "{answers:?}");
+        send(&mut e, FromProxy::Permission("tab.staff".into()));
+        let answers = bridge_answers(&mut e);
+        assert_eq!(answers, vec![ToProxy::HasPermission { permission: "tab.staff".into(), value: false }]);
+        // Scoreboard messages become packets for that player.
+        let team = send(
+            &mut e,
+            FromProxy::Team {
+                name: "01Steve".into(),
+                action: 0,
+                prefix: "&cP".into(),
+                suffix: String::new(),
+                options: 3,
+                visibility: "never".into(),
+                collision: "pushOwnTeam".into(),
+                color: 12,
+                players: vec!["Steve".into()],
+            },
+        );
+        let Out::TeamCreate { name, params, players } = &team[0].out else { panic!("{team:?}") };
+        assert_eq!((name.as_str(), params.visibility, params.collision, params.color, params.options), ("01Steve", 1, 3, Some(12), 3));
+        assert_eq!(players, &vec!["Steve".to_owned()]);
+        assert_eq!(team[0].to, 1);
+        let obj = send(
+            &mut e,
+            FromProxy::Objective { name: "o".into(), action: 0, title: "{\"text\":\"T\"}".into(), display: 1, number_format: Some("blank".into()) },
+        );
+        assert!(matches!(&obj[0].out, Out::Objective { method: ObjectiveMethod::Add, hearts: true, format: Some(NumberFmt::Blank), .. }));
+        let score = send(&mut e, FromProxy::Score { objective: "o".into(), action: 0, holder: "Steve".into(), score: 7, display_name: None, number_format: None });
+        assert!(matches!(&score[0].out, Out::Score { score: 7, .. }));
+        // Unload takes the team and the objective away again.
+        let gone = send(&mut e, FromProxy::Unload);
+        assert!(gone.iter().any(|p| matches!(&p.out, Out::TeamRemove { name } if name == "01Steve")));
+        assert!(gone.iter().any(|p| matches!(&p.out, Out::Objective { method: ObjectiveMethod::Remove, .. })));
+        assert!(!e.bridge.active(1));
+    }
+
+    #[test]
+    fn a_broken_bridge_message_is_noted_not_fatal() {
+        let mut e = engine("", "");
+        let _ = e.tick(1000, server(), vec![player("Steve", 1)]);
+        assert!(e.bridge_receive(1, &[0, 3, b'x', b'y', b'z']).is_empty());
+        assert_eq!(e.bridge.problems.len(), 1);
     }
 }

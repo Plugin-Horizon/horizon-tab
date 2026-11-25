@@ -101,6 +101,7 @@ fn builtin_interval(token: &str) -> Option<i64> {
         "%memory-used%" | "%memory-used-gb%" | "%health%" => 200,
         "%staffonline%" | "%nonstaffonline%" => 2000,
         "%gamemode%" | "%mspt%" => 1000,
+        t if t.starts_with("%online_") || t.starts_with("%playerlist-group_") => 1000,
         _ => return None,
     })
 }
@@ -123,6 +124,7 @@ fn server_wide(token: &str) -> bool {
             | "%serveronline%"
     ) || token.starts_with("%server_")
         || token.starts_with("%online_")
+        || token.starts_with("%playerlist-group_")
 }
 
 pub struct TabPlaceholders {
@@ -246,6 +248,22 @@ impl TabPlaceholders {
         let Some((_, rules)) = self.replacements.iter().find(|(k, _)| k == token) else {
             return value;
         };
+        self.apply_rules(rules, value, ctx, depth)
+    }
+
+    /// `parse`, then the output replacements a proxy sent for the token when this server has none of its own.
+    pub fn parse_with_rules(&self, token: &str, ctx: &Ctx, extra: &[(String, Vec<(String, String)>)]) -> String {
+        let value = self.parse(token, ctx);
+        if self.replacements.iter().any(|(k, _)| k == token) {
+            return value;
+        }
+        match extra.iter().find(|(k, _)| k == token) {
+            Some((_, rules)) => self.apply_rules(rules, value, ctx, 0),
+            None => value,
+        }
+    }
+
+    fn apply_rules(&self, rules: &[(String, String)], value: String, ctx: &Ctx, depth: usize) -> String {
         let colored = text::colorize(&value);
         let mut chosen: Option<&String> = rules.iter().find(|(k, _)| text::colorize(k) == colored).map(|(_, v)| v);
         if chosen.is_none() {
@@ -348,9 +366,14 @@ impl TabPlaceholders {
             "%bedrock%" => t.bedrock.to_string(),
             "%player-version%" => t.version_name.clone(),
             "%player-version-id%" => t.version_id.to_string(),
-            "%online%" | "%serveronline%" => visible().count().to_string(),
+            "%online%" => (visible().count() + ctx.server.proxy_players.iter().filter(|r| !r.vanished).count()).to_string(),
+            "%serveronline%" => (visible().count()
+                + ctx.server.proxy_players.iter().filter(|r| !r.vanished && r.server.eq_ignore_ascii_case(&ctx.server.level_name)).count())
+            .to_string(),
             "%worldonline%" => visible().filter(|o| o.p.world == p.world).count().to_string(),
-            "%staffonline%" => visible().filter(|o| staff(*o)).count().to_string(),
+            "%staffonline%" => (visible().filter(|o| staff(*o)).count()
+                + ctx.server.proxy_players.iter().filter(|r| !r.vanished && r.staff).count())
+            .to_string(),
             "%nonstaffonline%" => visible().filter(|o| !staff(*o)).count().to_string(),
             "%time%" => crate::horizon_tab::datefmt::format_locale(&self.time_format, &self.now_local(), &self.locale),
             "%date%" => crate::horizon_tab::datefmt::format_locale(&self.date_format, &self.now_local(), &self.locale),
@@ -369,11 +392,23 @@ impl TabPlaceholders {
                 .unwrap_or_default(),
             _ => {
                 if let Some(server) = inner.strip_prefix("online_") {
-                    // One server here: its own name counts its players.
-                    if server.eq_ignore_ascii_case(&ctx.server.level_name) {
-                        return Some(visible().count().to_string());
-                    }
-                    return Some("0".into());
+                    // This server's own name counts the players here; the others come from the
+                    // players other TAB instances announced (`proxy-support`).
+                    let here = if server.eq_ignore_ascii_case(&ctx.server.level_name) { visible().count() } else { 0 };
+                    let remote = ctx
+                        .server
+                        .proxy_players
+                        .iter()
+                        .filter(|r| !r.vanished && r.server.eq_ignore_ascii_case(server))
+                        .count();
+                    return Some((here + remote).to_string());
+                }
+                if let Some(group) = inner.strip_prefix("playerlist-group_") {
+                    // `GlobalPlayerList`'s group counters: only with the feature on.
+                    let g = ctx.server.global.as_ref()?;
+                    let local = visible().map(|_| (ctx.server.level_name.clone(), false));
+                    let remote = ctx.server.proxy_players.iter().map(|r| (r.server.clone(), r.vanished));
+                    return Some(g.group_count(group, local.chain(remote)).to_string());
                 }
                 return placeholders::resolve(Some(p), ctx.server, inner);
             }

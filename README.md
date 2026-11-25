@@ -86,11 +86,11 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
+- Round 3: the fancy value shows (`player_set_display_score_text`, when the world shows an objective in that slot; else the number). The guard restores TAB's list name when another mod replaces it (`ServerPacketEvent::from_mod` plus TAB's own send tokens; the game's own packets already carry the hook's name).
+
 Round 2 (2026-11-25) wired the engine calls that now exist (teams as per-viewer packets, per-viewer list names, list and
 below-name numbers, sidebar, ping and game mode, the packet guard, the group bridge); the feature gates are gone.
 
-- The fancy value of the list and below-name objectives (text instead of the number) is not shown: `player_set_display_score` takes a number only (ENGINE_NEEDS `player_set_display_score_text`).
-- The guard drops foreign team moves and applies the ping spoof and the spectator fix, but does not restore TAB's name when another sender replaces it (ENGINE_NEEDS `server_packet_sender`).
 - `%online_<server>%`, `proxy-support` and the global player list need other backends' counts (ENGINE_NEEDS `proxy_server_player_count`).
 - Not done although the SDK now has the calls: `layout`, `per-world-playerlist` (tab list entries per viewer), unlimited name tags and opaque name tags (viewer entities, `player_send_entity_data`), full MiniMessage, `placeholders.locale` beyond en-US, `/tab cpu`, the help menu hover/click components, `/tab dump` upload.
 - The LuckPerms bridge gives the primary group only; prefixes and suffixes are not published to mods.

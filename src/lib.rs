@@ -267,8 +267,8 @@ fn send(host: &mut dyn ServerHost, packets: Vec<Packet>) {
                 if applied.sidebar {
                     changed.insert(to);
                 }
-                for (slot, owner, score) in applied.scores {
-                    display_score(host, to, slot, &owner, score);
+                for (slot, owner, score, fancy) in applied.scores {
+                    display_score(host, to, slot, &owner, score, fancy.as_ref());
                 }
             }
         }
@@ -287,6 +287,10 @@ struct State {
     views: HashMap<u128, View>,
     /// The guard's packet ids are being watched.
     watching: bool,
+    /// (viewer, player) list names TAB sent this tick and the guard has not yet seen go out: a
+    /// display name packet to a viewer that is a mod's send without one of these is another
+    /// sender's (`ServerPacketEvent::from_mod` cannot tell TAB from another mod).
+    own_names: HashSet<(u128, u128)>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
@@ -305,8 +309,9 @@ const SLOT_BELOW_NAME: i32 = 2;
 struct Applied {
     /// The sidebar may look different now.
     sidebar: bool,
-    /// (slot 0 or 2, score owner, new score or None to take it out of the slot).
-    scores: Vec<(u8, String, Option<i32>)>,
+    /// (slot 0 or 2, score owner, new score or None to take it out of the slot, the fancy value
+    /// text the number format shows instead of the number).
+    scores: Vec<(u8, String, Option<i32>, Option<Value>)>,
 }
 
 /// One viewer's objectives as the core's packets built them. The sidebar goes out whole
@@ -337,8 +342,8 @@ impl View {
 
     /// Every score of an objective, as the slot shows it.
     fn push_all(&self, slot: u8, objective: &str, set: bool, applied: &mut Applied) {
-        for (owner, (score, _, _)) in self.scores.get(objective).into_iter().flatten() {
-            applied.scores.push((slot, owner.clone(), set.then_some(*score)));
+        for (owner, (score, _, format)) in self.scores.get(objective).into_iter().flatten() {
+            applied.scores.push((slot, owner.clone(), set.then_some(*score), fixed(format.as_ref())));
         }
     }
 
@@ -397,14 +402,14 @@ impl View {
             Out::Score { owner, objective, score, display, format } => {
                 applied.sidebar = self.sidebar.as_deref() == Some(objective.as_str());
                 for slot in self.numbered_slot(&objective) {
-                    applied.scores.push((slot, owner.clone(), Some(score)));
+                    applied.scores.push((slot, owner.clone(), Some(score), fixed(format.as_ref())));
                 }
                 self.scores.entry(objective).or_default().insert(owner, (score, display, format));
             }
             Out::ResetScore { owner, objective } => {
                 applied.sidebar = self.sidebar.as_deref() == Some(objective.as_str());
                 for slot in self.numbered_slot(&objective) {
-                    applied.scores.push((slot, owner.clone(), None));
+                    applied.scores.push((slot, owner.clone(), None, None));
                 }
                 if let Some(s) = self.scores.get_mut(&objective) {
                     s.remove(&owner);
@@ -460,9 +465,26 @@ fn sidebar(host: &mut dyn ServerHost, viewer: u128) {
     let _ = player.set_sidebar(host, shown);
 }
 
+/// The text of a fixed number format (the fancy value), none for the number itself or `blank`.
+fn fixed(format: Option<&NumberFmt>) -> Option<Value> {
+    match format {
+        Some(NumberFmt::Fixed(v)) => Some(v.clone()),
+        _ => None,
+    }
+}
+
 /// A number in the tab list (slot 0) or below a name (slot 2) for `viewer`
-/// (`player_set_display_score`); the owner is a player's name.
-fn display_score(host: &mut dyn ServerHost, viewer: u128, slot: u8, owner: &str, score: Option<i32>) {
+/// (`player_set_display_score`); the owner is a player's name. A fancy value ("Ping: 40") is sent
+/// over it as the score's fixed number format (`player_set_display_score_text`), when the world
+/// shows an objective in that slot; otherwise the number stays.
+fn display_score(
+    host: &mut dyn ServerHost,
+    viewer: u128,
+    slot: u8,
+    owner: &str,
+    score: Option<i32>,
+    fancy: Option<&Value>,
+) {
     let Some(viewer) = host.player(viewer) else { return };
     let target = host
         .players()
@@ -471,6 +493,14 @@ fn display_score(host: &mut dyn ServerHost, viewer: u128, slot: u8, owner: &str,
         .find(|p| p.name(&*host).is_some_and(|n| n.eq_ignore_ascii_case(owner)));
     if let Some(target) = target {
         let _ = viewer.set_display_score(host, slot, target, score);
+        if let (Some(score), Some(fancy)) = (score, fancy) {
+            let name = match slot {
+                0 => "list",
+                _ => "below_name",
+            };
+            let text = text_json(&*host, fancy);
+            let _ = viewer.set_display_score_text(host, name, owner, score, Some(text));
+        }
     }
 }
 
@@ -507,7 +537,9 @@ fn display_names(host: &mut dyn ServerHost, viewer: u128, entries: Vec<(u128, Op
         let Some(target) = host.player(uuid) else { continue };
         let text = name.as_ref().map(|json| text_json(&*host, json));
         let _ = viewer_ref.set_list_name_for(host, target, text);
-        state().list_names.insert((viewer, uuid), key);
+        let mut st = state();
+        st.own_names.insert((viewer, uuid));
+        st.list_names.insert((viewer, uuid), key);
     }
 }
 
@@ -797,11 +829,21 @@ impl Hooks for Mod {
             level_name,
         };
         let packets = api::tick(now_ms(), server, players);
+        state().own_names.clear();
         send(host, packets);
     }
 
     /// Another sender's packets that undo TAB's: a team move, a ping or a game mode (anti-override).
     fn server_packet(&self, _: &mut dyn ServerHost, event: &mut ServerPacketEvent<'_>) -> Flow {
+        // A display name a mod sent that TAB did not: put ours back with the next tick. The game's
+        // own packets (`from_mod` false) carry the names of the tab-list name hook already.
+        if event.from_mod && event.packet_id == crate::horizon_tab::guard::PLAYER_INFO_UPDATE {
+            for uuid in crate::horizon_tab::guard::display_name_uuids(event.body.as_slice()) {
+                if !state().own_names.remove(&(event.player, uuid)) {
+                    api::display_name_overwritten(uuid);
+                }
+            }
+        }
         match crate::horizon_tab::guard::rule(event.player, event.packet_id, event.body.as_slice()) {
             crate::horizon_tab::guard::Verdict::Keep => Flow::Continue,
             crate::horizon_tab::guard::Verdict::Cancel => Flow::Cancel,
@@ -946,7 +988,7 @@ mod tests {
         assert!(applied.scores.is_empty());
         // Showing the objective in the list slot sends what is kept.
         let applied = view.apply(Out::DisplaySlot { slot: 0, objective: "ping".into() });
-        assert_eq!(applied.scores, vec![(0, "a".to_owned(), Some(40))]);
+        assert_eq!(applied.scores, vec![(0, "a".to_owned(), Some(40), None)]);
         // A change and a reset go out for that slot.
         let applied = view.apply(Out::Score {
             owner: "a".into(),
@@ -955,9 +997,26 @@ mod tests {
             display: None,
             format: None,
         });
-        assert_eq!(applied.scores, vec![(0, "a".to_owned(), Some(55))]);
+        assert_eq!(applied.scores, vec![(0, "a".to_owned(), Some(55), None)]);
+        // A fancy value rides along as the text of the fixed number format.
+        let applied = view.apply(Out::Score {
+            owner: "a".into(),
+            objective: "ping".into(),
+            score: 56,
+            display: None,
+            format: Some(NumberFmt::Fixed(json!("Ping: 56"))),
+        });
+        assert_eq!(applied.scores, vec![(0, "a".to_owned(), Some(56), Some(json!("Ping: 56")))]);
+        let applied = view.apply(Out::Score {
+            owner: "a".into(),
+            objective: "ping".into(),
+            score: 55,
+            display: None,
+            format: None,
+        });
+        assert_eq!(applied.scores, vec![(0, "a".to_owned(), Some(55), None)]);
         let applied = view.apply(Out::ResetScore { owner: "a".into(), objective: "ping".into() });
-        assert_eq!(applied.scores, vec![(0, "a".to_owned(), None)]);
+        assert_eq!(applied.scores, vec![(0, "a".to_owned(), None, None)]);
         // Removing the objective takes its numbers out of the slot.
         view.apply(Out::Score {
             owner: "b".into(),
@@ -973,7 +1032,7 @@ mod tests {
             hearts: false,
             format: None,
         });
-        assert_eq!(applied.scores, vec![(0, "b".to_owned(), None)]);
+        assert_eq!(applied.scores, vec![(0, "b".to_owned(), None, None)]);
         assert!(view.list.is_none());
     }
 }

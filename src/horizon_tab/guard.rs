@@ -220,6 +220,13 @@ fn parse_info(body: &[u8]) -> Option<Vec<InfoEntry>> {
     Some(entries)
 }
 
+/// The players whose display name a player-info update carries (action bit 32).
+pub fn display_name_uuids(body: &[u8]) -> Vec<u128> {
+    parse_info(body)
+        .map(|entries| entries.iter().filter(|e| e.display_name).map(|e| e.uuid).collect())
+        .unwrap_or_default()
+}
+
 /// A player-info update to `viewer`: TAB's ping spoof and spectator fix are applied to the
 /// latency and game mode it carries. A body that does not read whole is left as it is.
 pub fn rule_player_info(viewer: u128, body: &[u8]) -> Verdict {
@@ -271,6 +278,23 @@ mod tests {
     fn string(out: &mut Vec<u8>, s: &str) {
         write_varint(out, s.len() as i32);
         out.extend_from_slice(s.as_bytes());
+    }
+
+    #[test]
+    fn display_name_entries_are_listed() {
+        // actions = update display name (32), one entry: uuid, then a present name (a string tag).
+        let mut b = vec![32u8];
+        write_varint(&mut b, 1);
+        b.extend_from_slice(&7u128.to_be_bytes());
+        b.push(1);
+        b.extend_from_slice(&[8, 0, 1, b'x']);
+        assert_eq!(display_name_uuids(&b), vec![7]);
+        // A latency-only update names nobody.
+        let mut b = vec![16u8];
+        write_varint(&mut b, 1);
+        b.extend_from_slice(&7u128.to_be_bytes());
+        write_varint(&mut b, 30);
+        assert!(display_name_uuids(&b).is_empty());
     }
 
     #[test]

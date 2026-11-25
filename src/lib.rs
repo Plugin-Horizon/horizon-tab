@@ -19,7 +19,8 @@
 pub mod horizon_tab;
 use crate::horizon_tab::api;
 use crate::horizon_tab::engine::PlayerIn;
-use crate::horizon_tab::out::{BossOut, Out, Packet};
+use crate::horizon_tab::listpacket;
+use crate::horizon_tab::out::{BossOut, ListEntry, Out, Packet};
 use crate::horizon_tab::placeholders::Server;
 use mod_api::serde_json::Value;
 use mod_api::{
@@ -183,7 +184,24 @@ fn player_in(host: &dyn ServerHost, player: PlayerRef) -> PlayerIn {
         entity_id: entity.id() as i32,
         protocol: protocol_of(host, player),
         fake: player.is_fake(host).unwrap_or(false),
+        skin: skin_of(host, player),
     }
+}
+
+/// The `textures` property of a player's profile (value, signature), read once per player.
+fn skin_of(host: &dyn ServerHost, player: PlayerRef) -> Option<(String, String)> {
+    let uuid = player.uuid();
+    if let Some(known) = state().skins.get(&uuid) {
+        return known.clone();
+    }
+    let found = player.profile(host).and_then(|p| {
+        p.properties
+            .into_iter()
+            .find(|x| x.name == "textures")
+            .map(|x| (x.value, x.signature.unwrap_or_default()))
+    });
+    state().skins.insert(uuid, found.clone());
+    found
 }
 
 /// A VarInt as the protocol writes it.
@@ -253,6 +271,21 @@ fn send(host: &mut dyn ServerHost, packets: Vec<Packet>) {
             Out::Latency(entries) => send_player_info(host, to, INFO_LATENCY, &entries),
             Out::GameModes(entries) => send_player_info(host, to, INFO_GAME_MODE, &entries),
             Out::DisplayNames(entries) => display_names(host, to, entries),
+            Out::ListAdd(entries) => list_add(host, to, entries),
+            Out::ListRemove(ids) => send_raw(host, to, "minecraft:player_info_remove", listpacket::remove_body(&ids)),
+            Out::ListNames(entries) => {
+                let named: Vec<(u128, Vec<u8>)> = entries
+                    .into_iter()
+                    .filter_map(|(id, name)| network_nbt(&*host, &name).map(|nbt| (id, nbt)))
+                    .collect();
+                if !named.is_empty() {
+                    send_raw(host, to, "minecraft:player_info_update", listpacket::names_body(&named));
+                }
+            }
+            Out::Listed { ids, listed } => {
+                send_raw(host, to, "minecraft:player_info_update", listpacket::listed_body(&ids, listed))
+            }
+            Out::EntityVisible { ids, visible, list } => entity_visible(host, to, &ids, visible, list),
             Out::TeamCreate { name, params, players } => {
                 let parameters = team_parameters(&*host, &params);
                 team_packet(host, to, TeamPacketSpec::Create { name, parameters, players });
@@ -291,6 +324,10 @@ struct State {
     /// display name packet to a viewer that is a mod's send without one of these is another
     /// sender's (`ServerPacketEvent::from_mod` cannot tell TAB from another mod).
     own_names: HashSet<(u128, u128)>,
+    /// Each online player's textures property (None: no profile properties), read once.
+    skins: HashMap<u128, Option<(String, String)>>,
+    /// When the opaque name tags last asked the game for lines of sight.
+    last_opaque_ms: i64,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
@@ -524,6 +561,69 @@ fn team_packet(host: &mut dyn ServerHost, viewer: u128, spec: TeamPacketSpec) {
     if let Ok(body) = host.team_packet_body(spec) {
         send_raw(host, viewer, "minecraft:set_player_team", body);
     }
+}
+
+/// A component as network NBT (what a packet's display name is), through the game's text boundary.
+fn network_nbt(host: &dyn ServerHost, json: &Value) -> Option<Vec<u8>> {
+    let text = text_json(host, json);
+    host.text_to_nbt(&text).ok()?.to_network_bytes().ok()
+}
+
+/// Fake tab-list entries for one viewer (the layout).
+fn list_add(host: &mut dyn ServerHost, viewer: u128, entries: Vec<ListEntry>) {
+    let displays: Vec<Option<Vec<u8>>> = entries.iter().map(|e| network_nbt(&*host, &e.display)).collect();
+    let adds: Vec<listpacket::Add<'_>> = entries
+        .iter()
+        .zip(displays)
+        .map(|(e, display)| listpacket::Add {
+            uuid: e.uuid,
+            skin: e.skin.as_ref(),
+            latency: e.latency,
+            display,
+            order: e.order,
+        })
+        .collect();
+    let body = listpacket::add_body(&adds);
+    send_raw(host, viewer, "minecraft:player_info_update", body);
+}
+
+/// Per-world playerlist: players hidden from (or shown to) one viewer, entity and list entry.
+fn entity_visible(host: &mut dyn ServerHost, viewer: u128, ids: &[u128], visible: bool, list: bool) {
+    let Some(viewer_ref) = host.player(viewer) else { return };
+    for id in ids {
+        if let Some(target) = host.player(*id) {
+            let _ = target.entity().set_visible_to(host, viewer_ref, visible);
+        }
+    }
+    if list {
+        send_raw(host, viewer, "minecraft:player_info_update", listpacket::listed_body(ids, visible));
+    }
+}
+
+/// Opaque name tags: every 250 ms, ask the game whether each viewer has a line of sight to each
+/// target the mode applies to, and hand the answers to the engine.
+fn opaque_sight(host: &mut dyn ServerHost) {
+    let now = now_ms();
+    if now - state().last_opaque_ms < 250 {
+        return;
+    }
+    state().last_opaque_ms = now;
+    let pairs = api::opaque_pairs();
+    if pairs.is_empty() {
+        return;
+    }
+    let mut results = Vec::with_capacity(pairs.len());
+    for (viewer, target) in pairs {
+        let sees = match (host.player(viewer), host.player(target)) {
+            (Some(v), Some(t)) => host
+                .living(v.entity())
+                .and_then(|living| living.has_line_of_sight(&*host, t.entity()))
+                .unwrap_or(true),
+            _ => true,
+        };
+        results.push((viewer, target, sees));
+    }
+    api::set_occlusion(&results);
 }
 
 /// TAB's tab list names, per viewer (`player_set_list_name_for`), and only when one changed.
@@ -810,6 +910,7 @@ impl Hooks for Mod {
             let mut st = state();
             st.list_names.retain(|(viewer, _), _| present.contains(viewer));
             st.views.retain(|viewer, _| present.contains(viewer));
+            st.skins.retain(|uuid, _| present.contains(uuid));
         }
         watch_guard(host);
         let players: Vec<PlayerIn> = online
@@ -831,6 +932,7 @@ impl Hooks for Mod {
         let packets = api::tick(now_ms(), server, players);
         state().own_names.clear();
         send(host, packets);
+        opaque_sight(host);
     }
 
     /// Another sender's packets that undo TAB's: a team move, a ping or a game mode (anti-override).

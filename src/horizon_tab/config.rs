@@ -119,6 +119,8 @@ pub struct Config {
     pub ping_spoof: Option<i32>,
     pub date_format: String,
     pub time_format: String,
+    /// `placeholders.locale`, a language tag for month and day names.
+    pub locale: String,
     pub time_offset_hours: f64,
     pub register_tab_expansion: bool,
     /// `placeholder-output-replacements`: placeholder -> (output -> replacement), in order.
@@ -133,6 +135,12 @@ pub struct Config {
     pub debug: bool,
     pub mysql: MysqlConfig,
     pub unsupported: Vec<String>,
+    /// `per-world-playerlist` when enabled.
+    pub per_world: Option<crate::horizon_tab::perworld::PerWorld>,
+    /// `layout` when enabled.
+    pub layout: Option<crate::horizon_tab::layout::LayoutCfg>,
+    /// Warnings the feature sections gave while reading (invalid slots, duplicate worlds...).
+    pub config_warnings: Vec<String>,
     /// Proxy-only keys that are switched on (`proxy-support.enabled`, `use-*`): read and ignored on a
     /// backend, so no warning, only a note at start.
     pub proxy_only_on: Vec<String>,
@@ -143,6 +151,9 @@ pub const PROXY_ONLY_KEYS: &[&str] = &[
     "proxy-support.enabled",
     "use-bukkit-permissions-manager",
     "use-online-uuid-in-tablist",
+    // TAB's GlobalPlayerList only adds players of other servers, and it learns them from the TAB
+    // plugin on the proxy; a backend alone has none to add.
+    "global-playerlist.enabled",
 ];
 
 /// Key paths (`*` = any key) of the files TAB keeps that the port reads. `check_original` compares the
@@ -211,9 +222,26 @@ pub const KEYS_READ: &[&str] = &[
     "permission-refresh-interval",
     "debug",
     "components.minimessage-support",
+    "placeholders.locale",
     "layout.enabled",
+    "layout.direction",
+    "layout.default-skin",
+    "layout.default-skins.*.skin",
+    "layout.default-skins.*.slots",
+    "layout.enable-remaining-players-text",
+    "layout.remaining-players-text",
+    "layout.empty-slot-ping-value",
+    "layout.layouts.*.display-condition",
+    "layout.layouts.*.default-skin",
+    "layout.layouts.*.slot-count",
+    "layout.layouts.*.fixed-slots",
+    "layout.layouts.*.groups.*.display-condition",
+    "layout.layouts.*.groups.*.slots",
     "global-playerlist.enabled",
     "per-world-playerlist.enabled",
+    "per-world-playerlist.allow-bypass-permission",
+    "per-world-playerlist.ignore-effect-in-worlds",
+    "per-world-playerlist.shared-playerlist-world-groups.*",
     "mysql.enabled",
     "mysql.host",
     "mysql.port",
@@ -399,6 +427,7 @@ impl Config {
                 .then(|| y.at(&["ping-spoof", "value"]).i64_or(0) as i32),
             date_format: ph.get("date-format").str_or("dd.MM.yyyy"),
             time_format: ph.get("time-format").str_or("[HH:mm:ss / h:mm a]"),
+            locale: ph.get("locale").str_or("en-US"),
             time_offset_hours: ph.get("time-offset").as_f64().unwrap_or(0.0),
             register_tab_expansion: ph.get("register-tab-expansion").bool_or(false),
             replacements,
@@ -412,6 +441,9 @@ impl Config {
             debug: y.get("debug").bool_or(false),
             mysql: MysqlConfig::from_yaml(y.get("mysql")),
             unsupported: Vec::new(),
+            per_world: None,
+            layout: None,
+            config_warnings: Vec::new(),
             proxy_only_on: Vec::new(),
         };
         for key in PROXY_ONLY_KEYS {
@@ -424,14 +456,15 @@ impl Config {
                 cfg.proxy_only_on.push((*key).to_owned());
             }
         }
-        for (key, what) in [
-            ("layout", "layout"),
-            ("global-playerlist", "global-playerlist"),
-            ("per-world-playerlist", "per-world-playerlist"),
-        ] {
-            if y.at(&[key, "enabled"]).bool_or(false) {
-                cfg.unsupported.push(what.to_owned());
-            }
+        if y.at(&["layout", "enabled"]).bool_or(false) {
+            let mut w = Vec::new();
+            cfg.layout = Some(crate::horizon_tab::layout::LayoutCfg::from_yaml(y.get("layout"), &mut w));
+            cfg.config_warnings.extend(w);
+        }
+        if y.at(&["per-world-playerlist", "enabled"]).bool_or(false) {
+            let mut w = Vec::new();
+            cfg.per_world = Some(crate::horizon_tab::perworld::PerWorld::from_yaml(y.get("per-world-playerlist"), &mut w));
+            cfg.config_warnings.extend(w);
         }
         cfg
     }

@@ -50,6 +50,19 @@ pub enum BossOut {
     },
 }
 
+/// One fake tab-list entry (`ClientboundPlayerInfoUpdatePacket`, ADD_PLAYER with the name, the
+/// skin, the latency, the display name and the list order).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListEntry {
+    pub uuid: u128,
+    /// The `textures` property (value, signature), if the slot has a skin.
+    pub skin: Option<(String, String)>,
+    pub latency: i32,
+    pub display: Value,
+    /// Higher is listed first (`UPDATE_LIST_ORDER`).
+    pub order: i32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Out {
     /// Header and footer (sent with the game's `native_tab_list`), with their plain text.
@@ -106,6 +119,17 @@ pub enum Out {
     GameModes(Vec<(u128, i32)>),
     /// A system chat line.
     Chat(Value),
+    /// Fake tab-list entries (the layout feature).
+    ListAdd(Vec<ListEntry>),
+    /// `ClientboundPlayerInfoRemovePacket`.
+    ListRemove(Vec<u128>),
+    /// `UPDATE_DISPLAY_NAME` for fake entries.
+    ListNames(Vec<(u128, Value)>),
+    /// `UPDATE_LISTED`: show or hide real entries in the tab list.
+    Listed { ids: Vec<u128>, listed: bool },
+    /// Hides or shows players' entities for the viewer (per-world playerlist); `list` also lists
+    /// or unlists them in the tab list.
+    EntityVisible { ids: Vec<u128>, visible: bool, list: bool },
 }
 
 /// A packet for one player.

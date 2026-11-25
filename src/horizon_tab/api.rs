@@ -142,6 +142,31 @@ pub fn guard_display_name(viewer: u128, uuid: u128) -> Option<Value> {
     guard.as_ref().and_then(|s| s.engine.guard_display_name(viewer, uuid))
 }
 
+/// An entry-add packet to `viewer` carries a profile name for `uuid` (a nick plugin's rename):
+/// the teams and scores name the new entry from the next tick on.
+pub fn guard_entry_name(viewer: u128, uuid: u128, name: &str) {
+    if let Some(s) = state().lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if s.engine.set_entry_name(viewer, uuid, name) {
+            s.engine.debug_note(&format!("Processing name change of player {uuid:032x} to {name}"));
+        }
+    }
+}
+
+/// The (viewer, target) pairs whose line of sight the opaque name tag mode needs this round.
+pub fn opaque_pairs() -> Vec<(u128, u128)> {
+    match state().lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        Some(s) => s.engine.opaque_pairs(),
+        None => Vec::new(),
+    }
+}
+
+/// The game's line-of-sight answers for those pairs.
+pub fn set_occlusion(results: &[(u128, u128, bool)]) {
+    if let Some(s) = state().lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        s.engine.set_occlusion(results);
+    }
+}
+
 /// `viewer` respawned: forget what their client holds from us, so the next tick sends it again.
 pub fn player_respawned(viewer: u128) {
     if let Some(s) = state().lock().unwrap_or_else(|e| e.into_inner()).as_mut() {

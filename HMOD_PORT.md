@@ -1,4 +1,5 @@
 # hmod port: tab
+Round 4 (2026-11-25, blind, not compiled): new modules `mm.rs` (full MiniMessage), `cpu.rs` (`/tab cpu`), `layout.rs` and `perworld.rs` (config, slot assignment, world groups), `listpacket.rs` (player-info packets as bytes); engine: layout and per-world sections of `update_viewer`, opaque name tags (`opaque_pairs` / `set_occlusion`, line of sight asked by `lib.rs` every 250 ms), nick compatibility (`set_entry_name`, team members and score owners follow the entry name the guard reads from an entry-add packet), `placeholders.locale` in `datefmt.rs`, `/tab dump` as a local file with the connection values censored. Unit tests carry literal values (rainbow hues, gradient steps, slot translation, packet layout, CPU percentages, regex patterns).
 Parity: 37% -> 40% now (42 -> 46 of 115 items) / ~53% -> ~57% with our PRs (MySQL adds 4 items: `/tab mysql upload`, `/tab mysql download`, the storage feature, the `mysql` section's keys; hand count, as before). Blind round 100, NOT compiled. Earlier rounds below.
 
 Round 100 (HUNDRED, blind, not compiled): MySQL storage

@@ -128,6 +128,7 @@ fn server_wide(token: &str) -> bool {
 pub struct TabPlaceholders {
     pub date_format: String,
     pub time_format: String,
+    pub locale: String,
     pub time_offset_hours: f64,
     pub replacements: Vec<(String, Vec<(String, String)>)>,
     pub default_refresh_ms: i64,
@@ -136,6 +137,9 @@ pub struct TabPlaceholders {
     pub conditions: HashMap<String, Condition>,
     pub now_ms: i64,
     cache: RefCell<HashMap<(u128, String), (String, i64)>>,
+    /// `/tab cpu`: nanoseconds spent per placeholder while tracking.
+    timings: RefCell<HashMap<String, u64>>,
+    pub track: std::cell::Cell<bool>,
 }
 
 const MAX_DEPTH: usize = 8;
@@ -145,6 +149,7 @@ impl TabPlaceholders {
         TabPlaceholders {
             date_format: cfg.date_format.clone(),
             time_format: cfg.time_format.clone(),
+            locale: cfg.locale.clone(),
             time_offset_hours: cfg.time_offset_hours,
             replacements: cfg.replacements.clone(),
             default_refresh_ms: cfg.default_refresh_ms,
@@ -162,7 +167,19 @@ impl TabPlaceholders {
                 .collect(),
             now_ms: 0,
             cache: RefCell::new(HashMap::new()),
+            timings: RefCell::new(HashMap::new()),
+            track: std::cell::Cell::new(false),
         }
+    }
+
+    /// The nanoseconds each placeholder took since the last call (`/tab cpu`).
+    pub fn take_timings(&self) -> HashMap<String, u64> {
+        std::mem::take(&mut *self.timings.borrow_mut())
+    }
+
+    /// A placeholder's refresh interval in ms and whether the config sets it.
+    pub fn refresh_info(&self, token: &str) -> (i64, bool) {
+        (self.interval(token), self.refresh_ms.contains_key(token))
     }
 
     /// Forgets a player's cached values (when they leave).
@@ -291,7 +308,12 @@ impl TabPlaceholders {
                 return Some(v.clone());
             }
         }
-        let v = self.compute(token, inner, ctx)?;
+        let started = self.track.get().then(std::time::Instant::now);
+        let v = self.compute(token, inner, ctx);
+        if let Some(at) = started {
+            *self.timings.borrow_mut().entry(token.to_owned()).or_insert(0) += at.elapsed().as_nanos() as u64;
+        }
+        let v = v?;
         self.cache.borrow_mut().insert(key, (v.clone(), self.now_ms));
         Some(v)
     }
@@ -330,8 +352,8 @@ impl TabPlaceholders {
             "%worldonline%" => visible().filter(|o| o.p.world == p.world).count().to_string(),
             "%staffonline%" => visible().filter(|o| staff(*o)).count().to_string(),
             "%nonstaffonline%" => visible().filter(|o| !staff(*o)).count().to_string(),
-            "%time%" => crate::horizon_tab::datefmt::format(&self.time_format, &self.now_local()),
-            "%date%" => crate::horizon_tab::datefmt::format(&self.date_format, &self.now_local()),
+            "%time%" => crate::horizon_tab::datefmt::format_locale(&self.time_format, &self.now_local(), &self.locale),
+            "%date%" => crate::horizon_tab::datefmt::format_locale(&self.date_format, &self.now_local(), &self.locale),
             "%memory-used%" => ctx.server.memory_used_mb.to_string(),
             "%memory-max%" => ctx.server.memory_max_mb.to_string(),
             "%memory-used-gb%" => builtin::two_decimals(ctx.server.memory_used_mb as f64 / 1024.0),

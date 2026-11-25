@@ -11,12 +11,13 @@
 use crate::horizon_tab::config::{Board, Config};
 use crate::horizon_tab::integration;
 use crate::horizon_tab::mysql;
-use crate::horizon_tab::out::{BossOut, NumberFmt, ObjectiveMethod, Out, Packet, TeamParams};
+use crate::horizon_tab::out::{ListEntry, BossOut, NumberFmt, ObjectiveMethod, Out, Packet, TeamParams};
 use crate::horizon_tab::placeholders::{self, uuid_string, Player, Server};
 use crate::horizon_tab::properties::{Properties, PropertyFile};
 use crate::horizon_tab::sorting::{self, SortingType};
 use crate::horizon_tab::tabph::{self, Ctx, TabPlaceholders, TabPlayer};
 use crate::horizon_tab::text;
+use crate::horizon_tab::layout::{self, Content};
 use crate::horizon_tab::yaml::{self, Yaml};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +51,8 @@ pub struct PlayerIn {
     /// A bot with no client (a fake player): it is shown to the others but nothing is built or
     /// sent for it as a viewer. local perf patch for fake players, candidate upstream PR.
     pub fake: bool,
+    /// The `textures` property of the profile (value, signature), for layout slots.
+    pub skin: Option<(String, String)>,
 }
 
 /// Bukkit's world folder name for a dimension (`world`, `world_nether`, `world_the_end`).
@@ -103,6 +106,28 @@ struct Sent {
     bars: HashMap<String, BarSent>,
     last_spectator_ms: i64,
     last_ping_spoof_ms: i64,
+    /// The team member entry sent for each target.
+    team_members: HashMap<u128, String>,
+    /// Players hidden from this viewer by the per-world playerlist.
+    pw_hidden: HashSet<u128>,
+    layout: Option<LayoutSent>,
+}
+
+/// What a viewer's client holds of the layout.
+#[derive(Clone, Debug, PartialEq)]
+struct LayoutSent {
+    name: String,
+    slots: std::collections::BTreeMap<u32, SlotSig>,
+    /// Real players taken out of the list.
+    hidden: HashSet<u128>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SlotSig {
+    skin: Option<(String, String)>,
+    latency: i32,
+    display: Value,
+    who: Option<u128>,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +145,12 @@ struct PState {
     nametag_view_hidden: bool,
     /// Viewers this player's name tag is hidden for (`/tab nametag hide <player> <viewer>`).
     nametag_hidden_for: HashSet<u128>,
+    /// `/tab nametag opaque`: this player's name tag shows only with a line of sight, for everyone
+    /// or for the viewers in `opaque_for`.
+    opaque: bool,
+    opaque_for: HashSet<u128>,
+    /// `/tab nametag opaqueview`: this player sees only the name tags they have a line of sight to.
+    opaque_view: bool,
     collision: Option<bool>,
     forced_board: Option<String>,
     /// Bars sent to this player alone (`/tab bossbar send`), until a time.
@@ -163,6 +194,15 @@ pub struct Engine {
     overwritten: HashSet<u128>,
     /// `playerdata.yml` exists but could not be read: toggles are then kept in memory only.
     playerdata_broken: bool,
+    /// `/tab cpu`.
+    pub cpu: crate::horizon_tab::cpu::Cpu,
+    /// The textures property of each online player (layout slots show it).
+    skins: HashMap<u128, (String, String)>,
+    /// The name a player's own tab-list entry carries when another plugin renamed it
+    /// (`NickCompatibility`); teams and scores name this entry.
+    entry_names: HashMap<u128, String>,
+    /// (viewer, target) pairs whose name tag the opaque mode hides: no line of sight.
+    occluded: HashSet<(u128, u128)>,
 }
 
 fn read_yaml(path: &Path, warnings: &mut Vec<String>) -> Yaml {
@@ -279,6 +319,7 @@ impl Engine {
     ) -> Engine {
         let (sorting, w) = sorting::compile(&cfg.teams.sorting_types);
         warnings.extend(w);
+        warnings.extend(cfg.config_warnings.iter().cloned());
         for feature in &cfg.unsupported {
             warnings.push(format!(
                 "{feature} is enabled in config.yml but not supported by this port; ignored"
@@ -301,6 +342,10 @@ impl Engine {
             server: Server::default(),
             playerdata_broken: false,
             overwritten: HashSet::new(),
+            cpu: Default::default(),
+            skins: HashMap::new(),
+            entry_names: HashMap::new(),
+            occluded: HashSet::new(),
         }
     }
 
@@ -380,7 +425,10 @@ impl Engine {
         server.now_ms = now_ms;
         server.online = inputs.iter().filter(|p| !p.vanished).count();
         let mut out = Vec::new();
+        self.ph.track.set(self.cpu.tracking());
+        self.cpu.start_lap();
         self.sync_players(&server, inputs, &mut out);
+        self.cpu.lap("Player tracking", "Joining, leaving and updating players");
         let snapshot: Vec<Player> = self.players.iter().map(|p| p.tp.p.clone()).collect();
         placeholders::update_snapshot(server.clone(), snapshot);
         self.server = server;
@@ -389,8 +437,10 @@ impl Engine {
             self.announced_board = None;
         }
         self.assign_team_names();
+        self.cpu.lap("Sorting", "Choosing team names");
         let all: Vec<TabPlayer> = self.players.iter().map(|p| p.tp.clone()).collect();
         let targets: Vec<TargetTexts> = (0..all.len()).map(|i| self.target_texts(i, &all)).collect();
+        self.cpu.lap("Placeholders", "Parsing player texts");
         for vi in 0..self.players.len() {
             // A fake player has no client: its view of the list would be built for no one.
             if self.players[vi].fake {
@@ -399,6 +449,7 @@ impl Engine {
             self.update_viewer(vi, &all, &targets, &mut out);
         }
         self.overwritten.clear();
+        self.cpu.roll(now_ms, self.ph.take_timings());
         out
     }
 
@@ -415,6 +466,9 @@ impl Engine {
         for g in &gone {
             let uuid = g.tp.p.uuid;
             self.ph.forget(uuid);
+            self.skins.remove(&uuid);
+            self.entry_names.remove(&uuid);
+            self.occluded.retain(|(v, t)| *v != uuid && *t != uuid);
             for v in &mut self.players {
                 if v.fake {
                     continue;
@@ -454,6 +508,14 @@ impl Engine {
             let bedrock = integration::first(|i| i.is_bedrock(input.uuid)).unwrap_or(false);
             let vanished = input.vanished || integration::first(|i| i.is_vanished(input.uuid)).unwrap_or(false);
             let existing = self.players.iter().position(|p| p.tp.p.uuid == input.uuid);
+            match &input.skin {
+                Some(s) => {
+                    self.skins.insert(input.uuid, s.clone());
+                }
+                None => {
+                    self.skins.remove(&input.uuid);
+                }
+            }
             if existing.is_none() {
                 self.load_mysql_user(&input.name, input.uuid);
             }
@@ -504,6 +566,9 @@ impl Engine {
                         nametag_hidden: false,
                         nametag_view_hidden: false,
                         nametag_hidden_for: HashSet::new(),
+                        opaque: false,
+                        opaque_for: HashSet::new(),
+                        opaque_view: false,
                         collision: None,
                         forced_board: None,
                         sent_bars: Vec::new(),
@@ -629,6 +694,7 @@ impl Engine {
         let mut sent = std::mem::take(&mut self.players[vi].sent);
         let push = |out: &mut Vec<Packet>, o: Out| out.push(Packet { to, out: o });
         let vctx = self.ctx(all, vi, vi);
+        self.cpu.start_lap();
 
         // Header and footer.
         if self.cfg.header_footer.enabled {
@@ -684,6 +750,8 @@ impl Engine {
             }
         }
 
+        self.cpu.lap("Header/Footer", "Updating");
+
         // Tab list names.
         if self.cfg.tablist_names.enabled {
             let mut changed = Vec::new();
@@ -714,12 +782,21 @@ impl Engine {
             }
         }
 
+        self.cpu.lap("Tablist name formatting", "Updating");
+
         // Teams: name tags and sorting.
         if self.cfg.teams.enabled {
             let viewer_hides = self.players[vi].nametag_view_hidden;
             for (ti, t) in targets.iter().enumerate() {
                 let uuid = all[ti].p.uuid;
                 let target = &self.players[ti];
+                // The entry name a nick plugin gave the client; a changed one moves the member.
+                let member = self.entry_name(&all[ti]);
+                if sent.team_members.get(&uuid).is_some_and(|m| *m != member) {
+                    if let Some((old, _)) = sent.teams.remove(&uuid) {
+                        push(out, Out::TeamRemove { name: old });
+                    }
+                }
                 let wanted = match (&target.team, t.teams_disabled) {
                     (Some(team), false) => {
                         let (prefix, suffix, color) = if t.tag_rel {
@@ -738,6 +815,7 @@ impl Engine {
                             self.cfg.teams.invisible_nametags
                                 || target.nametag_hidden
                                 || target.nametag_hidden_for.contains(&self.players[vi].tp.p.uuid)
+                                || self.occluded.contains(&(self.players[vi].tp.p.uuid, uuid))
                                 || (viewer_hides && ti != vi);
                         let collision = target.collision.unwrap_or(self.cfg.teams.enable_collision);
                         Some((
@@ -766,14 +844,16 @@ impl Engine {
                             Out::TeamCreate {
                                 name: name.clone(),
                                 params: params.clone(),
-                                players: vec![all[ti].p.name.clone()],
+                                players: vec![member.clone()],
                             },
                         );
                         sent.teams.insert(uuid, (name, params));
+                        sent.team_members.insert(uuid, member);
                     }
                     (Some((old, _)), None) => {
                         push(out, Out::TeamRemove { name: old });
                         sent.teams.remove(&uuid);
+                        sent.team_members.remove(&uuid);
                     }
                     (Some((old, old_params)), Some((name, params))) => {
                         if old != name {
@@ -783,10 +863,11 @@ impl Engine {
                                 Out::TeamCreate {
                                     name: name.clone(),
                                     params: params.clone(),
-                                    players: vec![all[ti].p.name.clone()],
+                                    players: vec![member.clone()],
                                 },
                             );
                             sent.teams.insert(uuid, (name, params));
+                            sent.team_members.insert(uuid, member);
                         } else if old_params != params {
                             push(
                                 out,
@@ -802,6 +883,8 @@ impl Engine {
                 }
             }
         }
+
+        self.cpu.lap("Scoreboard teams", "Updating");
 
         // Player list objective.
         if self.cfg.list_objective.enabled {
@@ -867,8 +950,13 @@ impl Engine {
                         let ctx = self.ctx(all, ti, vi);
                         self.component(&self.ph.parse(&c.fancy_value, &ctx))
                     });
-                    let entry = (all[ti].p.name.clone(), t.list_value, fancy.clone());
+                    let entry = (self.entry_name(&all[ti]), t.list_value, fancy.clone());
                     if sent.list_scores.get(&all[ti].p.uuid) != Some(&entry) {
+                        if let Some((old, _, _)) = sent.list_scores.get(&all[ti].p.uuid) {
+                            if *old != entry.0 {
+                                push(out, Out::ResetScore { owner: old.clone(), objective: LIST_OBJECTIVE.into() });
+                            }
+                        }
                         push(
                             out,
                             Out::Score {
@@ -884,6 +972,8 @@ impl Engine {
                 }
             }
         }
+
+        self.cpu.lap("Playerlist objective", "Updating");
 
         // Below name objective.
         if self.cfg.belowname.enabled {
@@ -944,8 +1034,13 @@ impl Engine {
                         let ctx = self.ctx(all, ti, vi);
                         self.component(&self.ph.parse(&c.fancy_value, &ctx))
                     });
-                    let entry = (all[ti].p.name.clone(), t.below_value, fancy.clone());
+                    let entry = (self.entry_name(&all[ti]), t.below_value, fancy.clone());
                     if sent.below_scores.get(&all[ti].p.uuid) != Some(&entry) {
+                        if let Some((old, _, _)) = sent.below_scores.get(&all[ti].p.uuid) {
+                            if *old != entry.0 {
+                                push(out, Out::ResetScore { owner: old.clone(), objective: BELOW_OBJECTIVE.into() });
+                            }
+                        }
                         push(
                             out,
                             Out::Score {
@@ -961,6 +1056,8 @@ impl Engine {
                 }
             }
         }
+
+        self.cpu.lap("Belowname", "Updating");
 
         // Sidebar scoreboard.
         if self.cfg.scoreboard.enabled {
@@ -1011,6 +1108,8 @@ impl Engine {
                 }
             }
         }
+
+        self.cpu.lap("Scoreboard", "Updating");
 
         // Boss bars.
         if self.cfg.bossbar.enabled {
@@ -1120,6 +1219,8 @@ impl Engine {
             }
         }
 
+        self.cpu.lap("BossBar", "Updating");
+
         // Spectators shown as survival to the others.
         if self.cfg.prevent_spectator_effect && self.now_ms - sent.last_spectator_ms >= SPECTATOR_RESEND_MS {
             let bypass = integration::permission(to, "tab.spectatorbypass", 0);
@@ -1137,6 +1238,8 @@ impl Engine {
             sent.last_spectator_ms = self.now_ms;
         }
 
+        self.cpu.lap("Spectator fix", "Updating");
+
         // Ping spoof.
         if let Some(value) = self.cfg.ping_spoof {
             if self.now_ms - sent.last_ping_spoof_ms >= PING_SPOOF_RESEND_MS || sent.last_ping_spoof_ms == 0 {
@@ -1145,6 +1248,12 @@ impl Engine {
             }
         }
 
+        self.cpu.lap("Ping spoof", "Updating");
+
+        self.layout_for(vi, all, targets, &mut sent, out);
+        self.cpu.lap("Layout", "Updating");
+        self.per_world_for(vi, all, &mut sent, out);
+        self.cpu.lap("Per world playerlist", "Updating");
         self.players[vi].sent = sent;
     }
 
@@ -1232,13 +1341,366 @@ impl Engine {
         sent.sidebar = Some(SidebarSent { title, lines });
     }
 
+    /// A line for the console when `debug` is on in config.yml.
+    pub fn debug_note(&self, line: &str) {
+        if self.cfg.debug {
+            eprintln!("[tab] [debug] {line}");
+        }
+    }
+
+    // ---- nick compatibility ---------------------------------------------------------------------
+
+    /// The name of a player's own tab-list entry as the client holds it: the profile name, or the
+    /// one a nick plugin put in its place (`NickCompatibility`).
+    pub(crate) fn entry_name(&self, tp: &TabPlayer) -> String {
+        self.entry_names.get(&tp.p.uuid).cloned().unwrap_or_else(|| tp.p.name.clone())
+    }
+
+    /// An entry-add packet another sender sent `viewer` carries `name` for `uuid`. TAB reads it only
+    /// when the player is its own receiver (`packetPlayer == packetReceiver`); a changed name makes
+    /// the teams and the list and below-name scores name the new entry. True when it changed.
+    pub fn set_entry_name(&mut self, viewer: u128, uuid: u128, name: &str) -> bool {
+        if viewer != uuid || name.is_empty() {
+            return false;
+        }
+        let Some(i) = self.index_of(uuid) else { return false };
+        let current = self.entry_name(&self.players[i].tp);
+        if current == name {
+            return false;
+        }
+        if name == self.players[i].tp.p.name {
+            self.entry_names.remove(&uuid);
+        } else {
+            self.entry_names.insert(uuid, name.to_owned());
+        }
+        true
+    }
+
+    // ---- opaque name tags -----------------------------------------------------------------------
+
+    /// `/tab nametag opaque <player> [viewer]`: the name tag shows only with a line of sight. Shows
+    /// the tag first, as TAB does (the hide command's reason is lifted).
+    pub(crate) fn set_opaque(&mut self, p: usize, viewer: Option<usize>) {
+        match viewer {
+            Some(v) => {
+                let u = self.players[v].tp.p.uuid;
+                self.players[p].nametag_hidden_for.remove(&u);
+                self.players[p].opaque_for.insert(u);
+            }
+            None => {
+                self.players[p].nametag_hidden = false;
+                self.players[p].opaque = true;
+            }
+        }
+    }
+
+    /// Show, hide and toggle end the opaque mode they are used on.
+    pub(crate) fn clear_opaque(&mut self, p: usize, viewer: Option<usize>) {
+        match viewer {
+            Some(v) => {
+                let u = self.players[v].tp.p.uuid;
+                self.players[p].opaque_for.remove(&u);
+                self.occluded.remove(&(u, self.players[p].tp.p.uuid));
+            }
+            None => {
+                self.players[p].opaque = false;
+                self.players[p].opaque_for.clear();
+                let t = self.players[p].tp.p.uuid;
+                self.occluded.retain(|(_, target)| *target != t);
+            }
+        }
+    }
+
+    pub(crate) fn set_opaque_view(&mut self, i: usize, on: bool) {
+        self.players[i].opaque_view = on;
+        if on {
+            self.players[i].nametag_view_hidden = false;
+        } else {
+            let v = self.players[i].tp.p.uuid;
+            self.occluded.retain(|(viewer, _)| *viewer != v);
+        }
+    }
+
+    /// `VisibilityManager.isOpaqueNameTagMode`: does `viewer` see `target`'s name tag only with a
+    /// line of sight?
+    fn opaque_applies(&self, viewer: usize, target: usize) -> bool {
+        let (v, t) = (&self.players[viewer], &self.players[target]);
+        viewer != target && (t.opaque || t.opaque_for.contains(&v.tp.p.uuid) || v.opaque_view)
+    }
+
+    /// The pairs (viewer, target) whose line of sight the game has to answer: opaque mode applies,
+    /// both are in the same world and the viewer can see the target at all. Pairs that do not apply
+    /// any more lose their verdict.
+    pub fn opaque_pairs(&mut self) -> Vec<(u128, u128)> {
+        let mut pairs = Vec::new();
+        if !self.cfg.teams.enabled {
+            return pairs;
+        }
+        for v in 0..self.players.len() {
+            if self.players[v].fake {
+                continue;
+            }
+            for t in 0..self.players.len() {
+                if !self.opaque_applies(v, t) {
+                    continue;
+                }
+                let (vp, tp) = (&self.players[v].tp.p, &self.players[t].tp.p);
+                if vp.world == tp.world && !tp.vanished {
+                    pairs.push((vp.uuid, tp.uuid));
+                }
+            }
+        }
+        self.occluded.retain(|pair| pairs.contains(pair));
+        pairs
+    }
+
+    /// The game's answers: (viewer, target, has line of sight). A target the viewer cannot see
+    /// (another world) is hidden whatever the game says, as `canSeeForOpaque` has it.
+    pub fn set_occlusion(&mut self, results: &[(u128, u128, bool)]) {
+        for (viewer, target, sees) in results {
+            if *sees {
+                self.occluded.remove(&(*viewer, *target));
+            } else {
+                self.occluded.insert((*viewer, *target));
+            }
+        }
+    }
+
+    // ---- per-world playerlist and layout --------------------------------------------------------
+
+    fn per_world_for(&self, vi: usize, all: &[TabPlayer], sent: &mut Sent, out: &mut Vec<Packet>) {
+        let Some(pw) = &self.cfg.per_world else { return };
+        let me = &all[vi];
+        let to = me.p.uuid;
+        let bypass = integration::permission(to, "tab.bypass", me.p.op_level);
+        let sees_vanished = integration::permission(to, "tab.seevanished", me.p.op_level);
+        let wanted: HashSet<u128> = all
+            .iter()
+            .enumerate()
+            .filter(|(ti, t)| {
+                *ti != vi && (!pw.sees(&me.p.world, &t.p.world, bypass) || (t.p.vanished && !sees_vanished))
+            })
+            .map(|(_, t)| t.p.uuid)
+            .collect();
+        let list = sent.layout.is_none();
+        let mut hide: Vec<u128> = wanted.difference(&sent.pw_hidden).copied().collect();
+        let mut show: Vec<u128> = sent
+            .pw_hidden
+            .difference(&wanted)
+            .copied()
+            .filter(|u| all.iter().any(|t| t.p.uuid == *u))
+            .collect();
+        hide.sort_unstable();
+        show.sort_unstable();
+        if !hide.is_empty() {
+            out.push(Packet { to, out: Out::EntityVisible { ids: hide, visible: false, list } });
+        }
+        if !show.is_empty() {
+            out.push(Packet { to, out: Out::EntityVisible { ids: show, visible: true, list } });
+        }
+        sent.pw_hidden = wanted;
+    }
+
+    /// The skin a layout skin text names, when this port can resolve it.
+    fn skin_of(&self, spec: &str) -> Option<(String, String)> {
+        if let Some(rest) = spec.strip_prefix("signed_texture:") {
+            let mut it = rest.splitn(2, ';');
+            let value = it.next().filter(|v| !v.is_empty())?;
+            return Some((value.to_owned(), it.next().unwrap_or("").to_owned()));
+        }
+        if let Some(name) = spec.strip_prefix("player:") {
+            let p = self.players.iter().find(|p| p.tp.p.name.eq_ignore_ascii_case(name.trim()))?;
+            return self.skins.get(&p.tp.p.uuid).cloned();
+        }
+        None
+    }
+
+    /// The tab-list text of `ti` for `vi`: their TAB format, or their name.
+    fn tab_display(&self, vi: usize, ti: usize, all: &[TabPlayer], targets: &[TargetTexts]) -> Value {
+        let t = &targets[ti];
+        if self.cfg.tablist_names.enabled && !t.names_disabled {
+            if t.tab_rel {
+                self.component(&self.ph.parse(&t.tab_raw, &self.ctx(all, ti, vi)))
+            } else {
+                t.tab.clone()
+            }
+        } else {
+            json!({ "text": all[ti].p.name })
+        }
+    }
+
+    fn layout_for(&self, vi: usize, all: &[TabPlayer], targets: &[TargetTexts], sent: &mut Sent, out: &mut Vec<Packet>) {
+        let Some(lc) = &self.cfg.layout else { return };
+        let me = &all[vi];
+        let to = me.p.uuid;
+        let vctx = self.ctx(all, vi, vi);
+        let def = if me.bedrock { None } else { lc.layouts.iter().find(|l| self.condition(&l.condition, &vctx)) };
+        let Some(def) = def else {
+            if let Some(old) = sent.layout.take() {
+                self.layout_remove(to, lc.direction, &old, all, out);
+            }
+            return;
+        };
+        if sent.layout.as_ref().is_some_and(|l| l.name != def.name) {
+            if let Some(old) = sent.layout.take() {
+                self.layout_remove(to, lc.direction, &old, all, out);
+            }
+        }
+        let mut state = sent.layout.take().unwrap_or(LayoutSent {
+            name: def.name.clone(),
+            slots: Default::default(),
+            hidden: HashSet::new(),
+        });
+
+        let mut wanted: std::collections::BTreeMap<u32, SlotSig> = Default::default();
+        // Fixed slots.
+        for f in &def.fixed {
+            let text = self.ph.parse(&f.text, &vctx);
+            let latency = match f.ping.as_deref().map(|p| self.ph.parse(p, &vctx)) {
+                Some(p) => p.trim().parse::<f64>().map(|v| v.round() as i32).unwrap_or(lc.empty_ping),
+                None => lc.empty_ping,
+            };
+            let skin = self.skin_of(&self.ph.parse(&def.fixed_skin(lc, f), &vctx));
+            wanted.insert(f.slot, SlotSig { skin, latency, display: self.component(&text), who: None });
+        }
+        // Players, in the order the sorting gives, as the viewer may see them.
+        let sees_vanished = integration::permission(to, "tab.seevanished", me.p.op_level);
+        let mut order: Vec<usize> = (0..all.len())
+            .filter(|&ti| ti == vi || !all[ti].p.vanished || sees_vanished)
+            .collect();
+        order.sort_by(|&a, &b| {
+            let (ta, tb) = (self.players[a].team.as_deref().unwrap_or(""), self.players[b].team.as_deref().unwrap_or(""));
+            ta.cmp(tb).then_with(|| all[a].p.name.to_lowercase().cmp(&all[b].p.name.to_lowercase()))
+        });
+        let placed = layout::assign(lc, def, &order, &mut |g, p| {
+            g.condition.as_deref().is_none_or(|c| self.ph.short_met(c, &self.ctx(all, p, vi)))
+        });
+        for (_, g) in &def.groups {
+            for slot in &g.slots {
+                let sig = match placed.get(slot) {
+                    Some(Content::Player(ti)) => SlotSig {
+                        skin: self.skins.get(&all[*ti].p.uuid).cloned(),
+                        latency: self.cfg.ping_spoof.unwrap_or(all[*ti].p.ping),
+                        display: self.tab_display(vi, *ti, all, targets),
+                        who: Some(all[*ti].p.uuid),
+                    },
+                    Some(Content::Text(t)) => SlotSig {
+                        skin: self.skin_of(def.empty_skin(lc, *slot).as_str()),
+                        latency: lc.empty_ping,
+                        display: self.component(t),
+                        who: None,
+                    },
+                    None => continue,
+                };
+                wanted.insert(*slot, sig);
+            }
+        }
+        // Everything else is an empty entry.
+        for slot in def.empty_slots() {
+            wanted.insert(
+                slot,
+                SlotSig {
+                    skin: self.skin_of(def.empty_skin(lc, slot).as_str()),
+                    latency: lc.empty_ping,
+                    display: json!({ "text": "" }),
+                    who: None,
+                },
+            );
+        }
+
+        let entry = |slot: u32, sig: &SlotSig| ListEntry {
+            uuid: layout::slot_uuid(lc.direction, slot),
+            skin: sig.skin.clone(),
+            latency: sig.latency,
+            display: sig.display.clone(),
+            order: layout::list_order(lc.direction, slot),
+        };
+        let (mut removes, mut adds, mut names, mut latencies) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (slot, sig) in &wanted {
+            let id = layout::slot_uuid(lc.direction, *slot);
+            match state.slots.get(slot) {
+                None => adds.push(entry(*slot, sig)),
+                Some(old) if old.skin != sig.skin || old.who != sig.who => {
+                    removes.push(id);
+                    adds.push(entry(*slot, sig));
+                }
+                Some(old) => {
+                    if old.display != sig.display {
+                        names.push((id, sig.display.clone()));
+                    }
+                    if old.latency != sig.latency {
+                        latencies.push((id, sig.latency));
+                    }
+                }
+            }
+        }
+        for slot in state.slots.keys() {
+            if !wanted.contains_key(slot) {
+                removes.push(layout::slot_uuid(lc.direction, *slot));
+            }
+        }
+        let mut push = |o: Out| out.push(Packet { to, out: o });
+        if !removes.is_empty() {
+            push(Out::ListRemove(removes));
+        }
+        if !adds.is_empty() {
+            push(Out::ListAdd(adds));
+        }
+        if !names.is_empty() {
+            push(Out::ListNames(names));
+        }
+        if !latencies.is_empty() {
+            push(Out::Latency(latencies));
+        }
+        // The real entries leave the list while a layout shows (`hideAllPlayers`).
+        state.hidden.retain(|u| all.iter().any(|t| t.p.uuid == *u));
+        let fresh: Vec<u128> = all.iter().map(|t| t.p.uuid).filter(|u| !state.hidden.contains(u)).collect();
+        if !fresh.is_empty() {
+            state.hidden.extend(fresh.iter().copied());
+            push(Out::Listed { ids: fresh, listed: false });
+        }
+        state.slots = wanted;
+        sent.layout = Some(state);
+    }
+
+    /// A layout taken away: its entries removed and the real ones listed again (`showAllPlayers`).
+    fn layout_remove(&self, to: u128, direction: layout::Direction, old: &LayoutSent, all: &[TabPlayer], out: &mut Vec<Packet>) {
+        let ids: Vec<u128> = old.slots.keys().map(|s| layout::slot_uuid(direction, *s)).collect();
+        if !ids.is_empty() {
+            out.push(Packet { to, out: Out::ListRemove(ids) });
+        }
+        let real: Vec<u128> = all.iter().map(|t| t.p.uuid).filter(|u| old.hidden.contains(u)).collect();
+        if !real.is_empty() {
+            out.push(Packet { to, out: Out::Listed { ids: real, listed: true } });
+        }
+    }
+
     /// Everything this mod showed, taken away (before a reload or at stop), and the sent state
     /// forgotten so the next tick sends it all again.
     pub fn unload(&mut self) -> Vec<Packet> {
         let mut out = Vec::new();
+        let online: Vec<u128> = self.players.iter().map(|p| p.tp.p.uuid).collect();
+        let direction = self.cfg.layout.as_ref().map(|l| l.direction);
         for v in &mut self.players {
             let to = v.tp.p.uuid;
             let s = std::mem::take(&mut v.sent);
+            if let (Some(l), Some(direction)) = (&s.layout, direction) {
+                let ids: Vec<u128> = l.slots.keys().map(|slot| layout::slot_uuid(direction, *slot)).collect();
+                if !ids.is_empty() {
+                    out.push(Packet { to, out: Out::ListRemove(ids) });
+                }
+                let real: Vec<u128> = online.iter().copied().filter(|u| l.hidden.contains(u)).collect();
+                if !real.is_empty() {
+                    out.push(Packet { to, out: Out::Listed { ids: real, listed: true } });
+                }
+            }
+            let back: Vec<u128> = s.pw_hidden.iter().copied().filter(|u| online.contains(u)).collect();
+            if !back.is_empty() {
+                out.push(Packet {
+                    to,
+                    out: Out::EntityVisible { ids: back, visible: true, list: s.layout.is_none() },
+                });
+            }
             if s.header.is_some() {
                 out.push(Packet {
                     to,
@@ -1478,6 +1940,7 @@ impl Engine {
     }
 
     pub(crate) fn set_nametag_view_hidden(&mut self, i: usize, hidden: Option<bool>) -> bool {
+        self.set_opaque_view(i, false);
         let h = hidden.unwrap_or(!self.players[i].nametag_view_hidden);
         self.players[i].nametag_view_hidden = h;
         h
@@ -1485,6 +1948,7 @@ impl Engine {
 
     /// `/tab nametag show|hide|toggle <player> [viewer]`: whether the name tag is hidden afterwards.
     pub(crate) fn nametag_target(&mut self, p: usize, viewer: Option<usize>, action: &str) -> bool {
+        self.clear_opaque(p, viewer);
         let viewer_uuid = viewer.map(|v| self.players[v].tp.p.uuid);
         let now = match viewer_uuid {
             Some(u) => self.players[p].nametag_hidden_for.contains(&u),
@@ -1871,4 +2335,125 @@ mod tests {
         assert_eq!(e.guard_latency(), Some(0));
     }
 
+
+    // ---- layout, per-world playerlist, opaque name tags, nick compatibility -------------------
+
+    const LAYOUT: &str = "layout:\n  enabled: true\n  empty-slot-ping-value: 500\n  layouts:\n    default:\n      slot-count: 6\n      fixed-slots:\n        - '1|&3Hello|signed_texture:VAL;SIG|42'\n      groups:\n        all:\n          slots:\n            - 2-4\n";
+
+    #[test]
+    fn layout_fills_slots_and_hides_the_real_entries() {
+        let mut e = engine(LAYOUT, "");
+        let packets = e.tick(1000, server(), vec![player("Steve", 1), player("Alex", 2)]);
+        let mine = for_whom(&packets, 1);
+        let adds: Vec<&Vec<crate::horizon_tab::out::ListEntry>> =
+            mine.iter().filter_map(|o| if let Out::ListAdd(a) = o { Some(a) } else { None }).collect();
+        assert_eq!(adds.len(), 1);
+        let a = adds[0];
+        assert_eq!(a.iter().map(|x| x.uuid).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(a[0].skin, Some(("VAL".to_owned(), "SIG".to_owned())));
+        assert_eq!(a[0].latency, 42);
+        assert_eq!(a[0].order, i32::MAX - 1);
+        assert_eq!(a[0].display["text"], "Hello");
+        // Alex sorts before Steve; both show their own ping.
+        assert_eq!(a[1].latency, 25);
+        assert_eq!(a[1].display["text"], "Alex");
+        assert_eq!(a[2].display["text"], "Steve");
+        assert_eq!(a[3].display["text"], "");
+        assert_eq!(a[3].latency, 500);
+        assert!(mine.iter().any(|o| matches!(o, Out::Listed { ids, listed: false } if ids == &vec![1, 2])));
+        // Nothing changes: nothing is sent.
+        let again = e.tick(1500, server(), vec![player("Steve", 1), player("Alex", 2)]);
+        assert!(for_whom(&again, 1).iter().all(|o| !matches!(
+            o,
+            Out::ListAdd(_) | Out::ListRemove(_) | Out::ListNames(_) | Out::Listed { .. }
+        )));
+        // A third player takes slot 4 (the entry is replaced) and leaves the list.
+        let later = e.tick(2000, server(), vec![player("Steve", 1), player("Alex", 2), player("Sam", 3)]);
+        let mine = for_whom(&later, 1);
+        assert!(mine.iter().any(|o| matches!(o, Out::ListRemove(ids) if ids.contains(&3) || ids.contains(&4))));
+        assert!(mine.iter().any(|o| matches!(o, Out::Listed { ids, listed: false } if ids == &vec![3])));
+    }
+
+    #[test]
+    fn the_layout_goes_away_with_unload() {
+        let mut e = engine(LAYOUT, "");
+        e.tick(1000, server(), vec![player("Steve", 1)]);
+        let gone = e.unload();
+        let mine = for_whom(&gone, 1);
+        assert!(mine.iter().any(|o| matches!(o, Out::ListRemove(ids) if ids.len() == 6)));
+        assert!(mine.iter().any(|o| matches!(o, Out::Listed { ids, listed: true } if ids == &vec![1])));
+    }
+
+    #[test]
+    fn a_layout_waits_for_its_condition() {
+        let config = LAYOUT.replace("    default:\n", "    default:\n      display-condition: '%world%=elsewhere'\n");
+        let mut e = engine(&config, "");
+        let packets = e.tick(1000, server(), vec![player("Steve", 1)]);
+        assert!(for_whom(&packets, 1).iter().all(|o| !matches!(o, Out::ListAdd(_) | Out::Listed { .. })));
+    }
+
+    fn nether(name: &str, uuid: u128) -> PlayerIn {
+        PlayerIn { dimension: "minecraft:the_nether".into(), ..player(name, uuid) }
+    }
+
+    #[test]
+    fn per_world_playerlist_hides_other_worlds_and_shows_them_again() {
+        let mut e = engine("per-world-playerlist:\n  enabled: true\n", "");
+        let packets = e.tick(1000, server(), vec![player("Steve", 1), nether("Alex", 2)]);
+        assert!(for_whom(&packets, 1)
+            .iter()
+            .any(|o| matches!(o, Out::EntityVisible { ids, visible: false, list: true } if ids == &vec![2])));
+        assert!(for_whom(&packets, 2)
+            .iter()
+            .any(|o| matches!(o, Out::EntityVisible { ids, visible: false, list: true } if ids == &vec![1])));
+        // Nothing new while they stay apart.
+        let same = e.tick(1500, server(), vec![player("Steve", 1), nether("Alex", 2)]);
+        assert!(same.iter().all(|p| !matches!(p.out, Out::EntityVisible { .. })));
+        // Alex comes to the overworld: both see each other again.
+        let back = e.tick(2000, server(), vec![player("Steve", 1), player("Alex", 2)]);
+        assert!(for_whom(&back, 1)
+            .iter()
+            .any(|o| matches!(o, Out::EntityVisible { ids, visible: true, .. } if ids == &vec![2])));
+    }
+
+    #[test]
+    fn opaque_name_tags_follow_the_line_of_sight() {
+        let mut e = engine(include_str!("../../data/tab/testdata/config.yml"), "");
+        let ps = || vec![player("Steve", 1), player("Alex", 2)];
+        let first = e.tick(1000, server(), ps());
+        assert!(for_whom(&first, 2).iter().any(|o| matches!(o, Out::TeamCreate { params, .. } if params.visibility == 0)));
+        let steve = e.find("Steve").unwrap();
+        e.set_opaque(steve, None);
+        let mut pairs = e.opaque_pairs();
+        pairs.sort();
+        assert_eq!(pairs, vec![(2, 1)]);
+        e.set_occlusion(&[(2, 1, false)]);
+        let hidden = e.tick(2000, server(), ps());
+        assert!(for_whom(&hidden, 2).iter().any(|o| matches!(o, Out::TeamUpdate { params, .. } if params.visibility == 1)));
+        // In sight again: the tag returns.
+        e.set_occlusion(&[(2, 1, true)]);
+        let shown = e.tick(3000, server(), ps());
+        assert!(for_whom(&shown, 2).iter().any(|o| matches!(o, Out::TeamUpdate { params, .. } if params.visibility == 0)));
+        // `show` ends the mode.
+        e.clear_opaque(steve, None);
+        assert!(e.opaque_pairs().is_empty());
+    }
+
+    #[test]
+    fn a_nick_plugin_rename_moves_the_team_member() {
+        let mut e = engine(include_str!("../../data/tab/testdata/config.yml"), "");
+        let ps = || vec![player("Steve", 1), player("Alex", 2)];
+        e.tick(1000, server(), ps());
+        assert!(!e.set_entry_name(2, 1, "Nick"), "only the receiver's own entry counts");
+        assert!(e.set_entry_name(1, 1, "Nick"));
+        assert!(!e.set_entry_name(1, 1, "Nick"));
+        let packets = e.tick(2000, server(), ps());
+        let created: Vec<&Out> = for_whom(&packets, 2)
+            .into_iter()
+            .filter(|o| matches!(o, Out::TeamCreate { players, .. } if players == &vec!["Nick".to_owned()]))
+            .collect();
+        assert_eq!(created.len(), 1, "{packets:?}");
+        // The old name comes back when the plugin restores it.
+        assert!(e.set_entry_name(1, 1, "Steve"));
+    }
 }

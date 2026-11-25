@@ -159,6 +159,8 @@ pub fn team_members(body: &[u8]) -> Option<(String, Vec<String>)> {
 #[derive(Debug, PartialEq, Eq)]
 struct InfoEntry {
     uuid: u128,
+    /// The profile name of an ADD_PLAYER entry.
+    name: Option<String>,
     game_mode: Option<(usize, usize, i32)>,
     latency: Option<(usize, usize, i32)>,
     display_name: bool,
@@ -171,8 +173,9 @@ fn parse_info(body: &[u8]) -> Option<Vec<InfoEntry>> {
     let mut entries = Vec::with_capacity(n.min(256));
     for _ in 0..n {
         let uuid = r.uuid()?;
+        let mut name = None;
         if actions & 1 != 0 {
-            r.string()?;
+            name = Some(r.string()?);
             let props = usize::try_from(r.varint()?).ok()?;
             for _ in 0..props {
                 r.string()?;
@@ -189,7 +192,7 @@ fn parse_info(body: &[u8]) -> Option<Vec<InfoEntry>> {
             let sig = usize::try_from(r.varint()?).ok()?;
             r.take(sig)?;
         }
-        let mut entry = InfoEntry { uuid, game_mode: None, latency: None, display_name: false };
+        let mut entry = InfoEntry { uuid, name, game_mode: None, latency: None, display_name: false };
         if actions & 4 != 0 {
             let start = r.pos;
             let value = r.varint()?;
@@ -227,10 +230,24 @@ pub fn display_name_uuids(body: &[u8]) -> Vec<u128> {
         .unwrap_or_default()
 }
 
+/// The (player, profile name) pairs a player-info update adds (action bit 1): what a nick plugin
+/// sends to rename a tab-list entry.
+pub fn added_names(body: &[u8]) -> Vec<(u128, String)> {
+    parse_info(body)
+        .map(|entries| entries.into_iter().filter_map(|e| e.name.map(|n| (e.uuid, n))).collect())
+        .unwrap_or_default()
+}
+
 /// A player-info update to `viewer`: TAB's ping spoof and spectator fix are applied to the
 /// latency and game mode it carries. A body that does not read whole is left as it is.
 pub fn rule_player_info(viewer: u128, body: &[u8]) -> Verdict {
     let Some(entries) = parse_info(body) else { return Verdict::Keep };
+    // Nick compatibility: a renamed entry of the receiver itself.
+    for entry in &entries {
+        if let Some(name) = &entry.name {
+            api::guard_entry_name(viewer, entry.uuid, name);
+        }
+    }
     // (start, end, new value), in packet order.
     let mut edits: Vec<(usize, usize, i32)> = Vec::new();
     for entry in &entries {
@@ -278,6 +295,24 @@ mod tests {
     fn string(out: &mut Vec<u8>, s: &str) {
         write_varint(out, s.len() as i32);
         out.extend_from_slice(s.as_bytes());
+    }
+
+    #[test]
+    fn added_entries_name_their_players() {
+        // actions = add player (1) | game mode (4): uuid, name, no properties, game mode 0.
+        let mut b = vec![1u8 | 4];
+        write_varint(&mut b, 1);
+        b.extend_from_slice(&9u128.to_be_bytes());
+        string(&mut b, "Nick");
+        write_varint(&mut b, 0);
+        write_varint(&mut b, 0);
+        assert_eq!(added_names(&b), vec![(9, "Nick".to_owned())]);
+        // A latency-only update adds nobody.
+        let mut b = vec![16u8];
+        write_varint(&mut b, 1);
+        b.extend_from_slice(&9u128.to_be_bytes());
+        write_varint(&mut b, 30);
+        assert!(added_names(&b).is_empty());
     }
 
     #[test]

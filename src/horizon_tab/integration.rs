@@ -77,6 +77,43 @@ pub(crate) fn first<T>(f: impl Fn(&dyn Integration) -> Option<T>) -> Option<T> {
     l.iter().find_map(|i| f(i.as_ref()))
 }
 
+/// The permission groups the game's provider published (`permission_groups`), kept by the glue
+/// each tick for the players on, answered as the primary group (LuckPerms/Vault bridge).
+fn host_groups() -> &'static RwLock<HashMap<u128, Vec<String>>> {
+    static G: OnceLock<RwLock<HashMap<u128, Vec<String>>>> = OnceLock::new();
+    G.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Replaces the groups the game's provider published: `(uuid, primary, all groups)` per player on.
+pub fn host_groups_set(players: Vec<(u128, Option<String>, Vec<String>)>) {
+    let mut map = HashMap::new();
+    for (uuid, primary, groups) in players {
+        // The primary group first, then the rest in the provider's order.
+        let mut list: Vec<String> = primary.into_iter().collect();
+        for g in groups {
+            if !list.contains(&g) {
+                list.push(g);
+            }
+        }
+        if !list.is_empty() {
+            map.insert(uuid, list);
+        }
+    }
+    *host_groups().write().unwrap_or_else(|e| e.into_inner()) = map;
+}
+
+/// Answers the primary group from `host_groups_set` (what a LuckPerms or Vault bridge gives TAB).
+pub struct HostGroups;
+
+impl Integration for HostGroups {
+    fn name(&self) -> &str {
+        "host-groups"
+    }
+    fn primary_group(&self, player: u128) -> Option<String> {
+        host_groups().read().unwrap_or_else(|e| e.into_inner()).get(&player).and_then(|l| l.first().cloned())
+    }
+}
+
 /// The game's permission service (`Game::native_permission_check`) as TAB sees it. The core cannot
 /// call the game, so the glue answers the nodes TAB asked about on its next tick; until then, and
 /// where nothing answers, the operator fallback stands.
@@ -145,6 +182,16 @@ mod tests {
     use super::*;
 
     // One test: the cache is process-wide, so the steps must not interleave with another test.
+    #[test]
+    fn host_groups_answer_the_primary_group() {
+        let p = 0xbeef_u128;
+        host_groups_set(vec![(p, Some("admin".into()), vec!["default".into(), "admin".into()])]);
+        assert_eq!(HostGroups.primary_group(p).as_deref(), Some("admin"));
+        assert_eq!(HostGroups.primary_group(p + 1), None);
+        host_groups_set(Vec::new());
+        assert_eq!(HostGroups.primary_group(p), None);
+    }
+
     #[test]
     fn host_answers_replace_the_operator_fallback() {
         let (p, node) = (0xfeed_u128, "tab.test.node");

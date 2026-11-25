@@ -53,3 +53,12 @@ Round 3 (blind, not compiled)
   `MySQLUserConfiguration`/`MySQLGroupConfiguration`) and the upload/download commands; the port's config is file-only, and
   the work was too large to write blind. `/tab mysql` stays the message-only answer (`mysql-fail-not-enabled`). The `mysql`
   crate is already used by husksync, so a later round can build on it.
+
+## Round 2 (2026-11-25)
+
+The `horizon_main_api`, `horizon_protocol_api` and `horizon_team_options_api` features are gone: their code is the normal code
+(the notes above describe how it started). Teams are now per-viewer `set_player_team` packets (`team_packet_body` +
+`player_send_packet`), so the world's scoreboard is untouched and options bit 2 (see friendly invisibles) works; list names use
+`player_set_list_name_for`; the list and below-name slots use `player_set_display_score`; the guard is `guard.rs` with
+`watch_outgoing_packets` + `server_packet`; `/bossbar` is answered in `player_command`; `HostGroups` feeds the primary group
+from `permission_groups`. Written blind, not compiled yet.

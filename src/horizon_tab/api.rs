@@ -114,6 +114,15 @@ pub fn guard_team(viewer: u128, team: &str, players: &[String]) -> bool {
     guard.as_ref().is_some_and(|s| s.engine.guard_team(viewer, team, players))
 }
 
+/// Whether any part of the guard is on (name tag teams, ping spoof, spectator fix), so the glue
+/// has the engine hold the watched packets only when TAB would use them.
+pub fn guard_needed() -> bool {
+    let guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().is_some_and(|s| {
+        s.engine.cfg.teams.enabled || s.engine.cfg.ping_spoof.is_some() || s.engine.cfg.prevent_spectator_effect
+    })
+}
+
 /// The latency TAB's ping spoof shows, if it is on.
 pub fn guard_latency() -> Option<i32> {
     let guard = state().lock().unwrap_or_else(|e| e.into_inner());

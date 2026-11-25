@@ -2,7 +2,7 @@
 
 ## Port status
 
-Item list: audit/rec100/tab.md (2026-11-24 count: 15 working of 40 items, 18 need engine APIs). Earlier estimate below is superseded.
+Item list: audit/rec100/tab.md (round 2, 2026-11-25: 30 of 43 items; the code is written against the combined next SDK and was not compiled yet). Earlier estimates below are superseded.
 
 > **Unofficial Rust port of TAB for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the TAB authors.**
 
@@ -86,18 +86,16 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+Round 2 (2026-11-25) wired the engine calls that now exist (teams as per-viewer packets, per-viewer list names, list and
+below-name numbers, sidebar, ping and game mode, the packet guard, the group bridge); the feature gates are gone.
 
-- With the Cargo feature `horizon_main_api` (needs a Horizon build that has the calls of main and PR #17980; off by default) ping, nickname, vanished, the sidebar, list names (the player's own view) and team colours and members work; the rest of this list stays.
-- With `horizon_team_options_api` (needs `horizon_main_api` and the team setters of branch `api-scoreboard-team-options`, PR #17980 stack) team prefixes, suffixes, name tag visibility, collision rules and friendly fire are set. With `horizon_protocol_api` (branch `api-player-protocol`) `%player-version%` shows the client's version. Both are off by default and were written without a compile.
-- Without `horizon_team_options_api`, scoreboard teams show the colour only (no name tag prefix/suffix, visibility or collision, no team sorting); without `horizon_main_api` they show nothing. The sidebar and the tab-list and below-name objective slots are dropped; ping and game mode are not sent.
-- The anti-override guard is off (outgoing packets cannot be watched), so other senders' team, latency or name packets are not put back.
-- `%player-version%` is wrong without `horizon_protocol_api` (no protocol read). Player-name arguments of `/tab` complete online names, only for senders with `tab.tabcomplete`; the literal sub-command words are not filtered per sender. An offline name is still accepted as typed.
-- A toggle named like a vanilla command (`/bossbar`) is only reachable as `/tab bossbar`.
-- List names are per player, not per viewer.
-- MySQL storage (`mysql.enabled`) is blind-written and not compiled yet. Its database calls run on the server thread (TAB uses a
-  thread of its own), so a join or an upload waits for them. `/tab dump` does not show the `mysql` section. Rows with
-  unknown properties get no `checkProperty` warning.
+- The fancy value of the list and below-name objectives (text instead of the number) is not shown: `player_set_display_score` takes a number only (ENGINE_NEEDS `player_set_display_score_text`).
+- The guard drops foreign team moves and applies the ping spoof and the spectator fix, but does not restore TAB's name when another sender replaces it (ENGINE_NEEDS `server_packet_sender`).
+- `%online_<server>%`, `proxy-support` and the global player list need other backends' counts (ENGINE_NEEDS `proxy_server_player_count`).
+- Not done although the SDK now has the calls: `layout`, `per-world-playerlist` (tab list entries per viewer), unlimited name tags and opaque name tags (viewer entities, `player_send_entity_data`), full MiniMessage, `placeholders.locale` beyond en-US, `/tab cpu`, the help menu hover/click components, `/tab dump` upload.
+- The LuckPerms bridge gives the primary group only; prefixes and suffixes are not published to mods.
+- Player-name arguments of `/tab` complete online names, only for senders with `tab.tabcomplete`; the literal sub-command words are not filtered per sender. An offline name is still accepted as typed.
+- MySQL storage (`mysql.enabled`) is blind-written. Its database calls run on the server thread. `/tab dump` does not show the `mysql` section. Rows with unknown properties get no `checkProperty` warning.
 
 ## Licence and origin
 

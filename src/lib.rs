@@ -7,11 +7,13 @@
 //! (host boss bar calls, one bar per viewer), the tab list name (`player_tab_list_name_format`),
 //! the tick (`server_tick`), respawns and the stop.
 //!
-//! Packets: latency and game mode per viewer were to go out through `player_send_packet`, which
-//! Horizon main lacks (HMOD-GAP). Permission nodes are declared once (`permission_gather_nodes`)
-//! and asked of the game as typed Boolean queries each tick. Not ported: teams (name tags),
-//! objectives (tab list ping and health, below name, sidebar), scores, per-viewer display names,
-//! the packet guard, and the LuckPerms bridge (its placeholders and prefixes).
+//! Packets (`player_send_packet`, `team_packet_body`): teams (name tags and sorting, with prefix,
+//! suffix, visibility, collision, friendly fire and seeing invisible teammates) are sent to each
+//! viewer alone, as are latency and game mode; list names per viewer (`player_set_list_name_for`),
+//! the sidebar (`player_set_sidebar`), the list and below-name numbers (`player_set_display_score`).
+//! The guard (`watch_outgoing_packets` + `server_packet`) puts back what another sender changes.
+//! Permission nodes are declared once (`permission_gather_nodes`) and asked of the game as typed
+//! Boolean queries each tick; the groups the game's provider published answer the group lookup.
 
 
 pub mod horizon_tab;
@@ -28,15 +30,11 @@ use mod_api::{
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StatType, Suggestion, TabCompleteEvent,
     Text,
 };
-use crate::horizon_tab::out::{NumberFmt, ObjectiveMethod};
-// Calls that exist on Horizon main only (feature `horizon_main_api`, off by default; see HMOD_PORT.md).
-#[cfg(feature = "horizon_main_api")]
+use crate::horizon_tab::out::{NumberFmt, ObjectiveMethod, TeamParams};
 use mod_api::{
-    ClientboundPlayPacket, Identifier, ScoreHolder, Sidebar, SidebarLine, TeamColor,
+    ClientboundPlayPacket, Identifier, PlayerCommandEvent, ServerPacketEvent, Sidebar, SidebarLine,
+    TeamPacketSpec, TeamParameters,
 };
-#[cfg(feature = "horizon_team_options_api")]
-use mod_api::{TeamCollisionRule, TeamVisibility};
-use crate::horizon_tab::out::TeamParams;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -140,42 +138,18 @@ fn text_of(value: &Value) -> Text {
     text
 }
 
-// `player_latency`, `player_nickname` and `player_hidden` (#17878) exist on Horizon main only. The
-// pinned SDK has no read, so without the feature `%ping%` is 0, no nickname is read and nobody is vanished.
-#[cfg(feature = "horizon_main_api")]
 fn ping_of(host: &dyn ServerHost, player: PlayerRef) -> i32 {
     player.latency(host).unwrap_or(0)
 }
-#[cfg(not(feature = "horizon_main_api"))]
-fn ping_of(_: &dyn ServerHost, _: PlayerRef) -> i32 {
-    0
-}
-#[cfg(feature = "horizon_main_api")]
 fn nickname_of(host: &dyn ServerHost, player: PlayerRef) -> Option<String> {
     player.nickname(host).flatten()
 }
-#[cfg(not(feature = "horizon_main_api"))]
-fn nickname_of(_: &dyn ServerHost, _: PlayerRef) -> Option<String> {
-    None
-}
-// `player_protocol_version` (#18797, branch `api-player-protocol`) is not on the pinned SDK. Without the
-// feature `%player-version%` shows protocol 0 (no version name).
-#[cfg(feature = "horizon_protocol_api")]
 fn protocol_of(host: &dyn ServerHost, player: PlayerRef) -> i32 {
     player.protocol_version(host).unwrap_or(0)
 }
-#[cfg(not(feature = "horizon_protocol_api"))]
-fn protocol_of(_: &dyn ServerHost, _: PlayerRef) -> i32 {
-    0
-}
 /// `player_hide` hides a player from everyone below a permission level; any level reads as vanished.
-#[cfg(feature = "horizon_main_api")]
 fn vanished_of(host: &dyn ServerHost, player: PlayerRef) -> bool {
     player.hidden(host).flatten().is_some()
-}
-#[cfg(not(feature = "horizon_main_api"))]
-fn vanished_of(_: &dyn ServerHost, _: PlayerRef) -> bool {
-    false
 }
 
 /// The player as the TAB core reads them each tick.
@@ -236,22 +210,16 @@ fn player_info_body(action: u8, entries: &[(u128, i32)]) -> Vec<u8> {
     body
 }
 
-/// Sends one player-info action to `viewer` alone.
-// HMOD-GAP(player_send_packet): Horizon main has no server-side call that sends a clientbound play
-// packet to one player (only the client's `send_packet`). Latency and game mode per viewer are not
-// sent; the bodies are still built by `player_info_body`.
-#[cfg(not(feature = "horizon_main_api"))]
-fn send_player_info(host: &mut dyn ServerHost, viewer: u128, action: u8, entries: &[(u128, i32)]) {
-    let _ = (host, viewer, player_info_body(action, entries));
+/// Sends one clientbound play packet to `viewer` alone (`player_send_packet`).
+fn send_raw(host: &mut dyn ServerHost, viewer: u128, name: &str, body: Vec<u8>) {
+    let Some(player) = host.player(viewer) else { return };
+    let Ok(id) = Identifier::parse(name) else { return };
+    let _ = host.player_send_packet(player, ClientboundPlayPacket::new(id, body));
 }
 
-/// `player_send_packet` of Horizon main sends the packet to that player as it is.
-#[cfg(feature = "horizon_main_api")]
+/// Sends one player-info action to `viewer` alone.
 fn send_player_info(host: &mut dyn ServerHost, viewer: u128, action: u8, entries: &[(u128, i32)]) {
-    let Some(player) = host.player(viewer) else { return };
-    let Ok(id) = Identifier::parse("minecraft:player_info_update") else { return };
-    let packet = ClientboundPlayPacket::new(id, player_info_body(action, entries));
-    let _ = host.player_send_packet(player, packet);
+    send_raw(host, viewer, "minecraft:player_info_update", player_info_body(action, entries));
 }
 
 /// The permission answer for a Boolean node, asked of the game as a typed query. Any refusal
@@ -284,22 +252,23 @@ fn send(host: &mut dyn ServerHost, packets: Vec<Packet>) {
             Out::Boss { id, action } => boss(host, to, id, action),
             Out::Latency(entries) => send_player_info(host, to, INFO_LATENCY, &entries),
             Out::GameModes(entries) => send_player_info(host, to, INFO_GAME_MODE, &entries),
-            // TODO(arismoko-api: watch_server_packets): the anti-override guard (`guard_packet`)
-            // is not wired: other senders' team, latency, game mode and name packets are not
-            // put back.
             Out::DisplayNames(entries) => display_names(host, to, entries),
             Out::TeamCreate { name, params, players } => {
-                team(host, &name, params.color, Some(players));
-                team_options(host, &name, &params);
+                let parameters = team_parameters(&*host, &params);
+                team_packet(host, to, TeamPacketSpec::Create { name, parameters, players });
             }
             Out::TeamUpdate { name, params } => {
-                team(host, &name, params.color, None);
-                team_options(host, &name, &params);
+                let parameters = team_parameters(&*host, &params);
+                team_packet(host, to, TeamPacketSpec::Update { name, parameters });
             }
-            Out::TeamRemove { name } => team_remove(host, &name),
+            Out::TeamRemove { name } => team_packet(host, to, TeamPacketSpec::Remove { name }),
             out @ (Out::Objective { .. } | Out::DisplaySlot { .. } | Out::Score { .. } | Out::ResetScore { .. }) => {
-                if state().views.entry(to).or_default().apply(out) {
+                let applied = state().views.entry(to).or_default().apply(out);
+                if applied.sidebar {
                     changed.insert(to);
+                }
+                for (slot, owner, score) in applied.scores {
+                    display_score(host, to, slot, &owner, score);
                 }
             }
         }
@@ -309,20 +278,15 @@ fn send(host: &mut dyn ServerHost, packets: Vec<Packet>) {
     }
 }
 
-/// What the TAB core sent so far that the engine keeps elsewhere: the world's teams (shared, so a
-/// team is set once, not once per viewer), the tab list names set and each viewer's objectives.
+/// What the TAB core sent so far that the engine keeps elsewhere: the display names set per
+/// viewer and each viewer's objectives.
 #[derive(Default)]
 struct State {
-    /// Team name -> its colour as last set.
-    teams: HashMap<String, Option<i32>>,
-    /// Player name -> team they were put on.
-    members: HashMap<String, String>,
-    /// Team name -> the options last applied to it (prefix, suffix, visibility, collision, friendly fire).
-    #[cfg_attr(not(feature = "horizon_team_options_api"), allow(dead_code))]
-    team_options: HashMap<String, TeamParams>,
-    /// Player -> list name JSON as last set (None = real name).
-    list_names: HashMap<u128, Option<String>>,
+    /// (viewer, player) -> list name JSON as last set (None = the usual name).
+    list_names: HashMap<(u128, u128), Option<String>>,
     views: HashMap<u128, View>,
+    /// The guard's packet ids are being watched.
+    watching: bool,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
@@ -331,64 +295,129 @@ fn state() -> MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// One viewer's objectives as the core's packets built them; only the sidebar slot is shown
-/// (`player_set_sidebar`). TODO(arismoko-api: objective slots): the list slot (tab list values) and the
-/// below-name slot have no API and are dropped.
+/// The tab list slot (`DisplaySlot.LIST`), the sidebar and below the name, as the core numbers them.
+const SLOT_LIST: i32 = 0;
+const SLOT_SIDEBAR: i32 = 1;
+const SLOT_BELOW_NAME: i32 = 2;
+
+/// What one packet changed on a viewer's screen.
+#[derive(Default)]
+struct Applied {
+    /// The sidebar may look different now.
+    sidebar: bool,
+    /// (slot 0 or 2, score owner, new score or None to take it out of the slot).
+    scores: Vec<(u8, String, Option<i32>)>,
+}
+
+/// One viewer's objectives as the core's packets built them. The sidebar goes out whole
+/// (`player_set_sidebar`); the list and below-name slots are numbers per player
+/// (`player_set_display_score`).
 #[derive(Default)]
 struct View {
     titles: HashMap<String, Value>,
+    /// Objective shown in the slot (sidebar, list, below name).
     sidebar: Option<String>,
+    list: Option<String>,
+    below: Option<String>,
     /// objective -> owner -> (score, display, number format)
     scores: HashMap<String, BTreeMap<String, (i32, Option<Value>, Option<NumberFmt>)>>,
 }
 
 impl View {
-    /// Applies one packet; true when the sidebar may look different now.
-    fn apply(&mut self, out: Out) -> bool {
+    fn numbered_slot(&self, objective: &str) -> Vec<u8> {
+        let mut slots = Vec::new();
+        if self.list.as_deref() == Some(objective) {
+            slots.push(0);
+        }
+        if self.below.as_deref() == Some(objective) {
+            slots.push(2);
+        }
+        slots
+    }
+
+    /// Every score of an objective, as the slot shows it.
+    fn push_all(&self, slot: u8, objective: &str, set: bool, applied: &mut Applied) {
+        for (owner, (score, _, _)) in self.scores.get(objective).into_iter().flatten() {
+            applied.scores.push((slot, owner.clone(), set.then_some(*score)));
+        }
+    }
+
+    /// Applies one packet; says what it changed.
+    fn apply(&mut self, out: Out) -> Applied {
+        let mut applied = Applied::default();
         match out {
             Out::Objective { name, method, title, .. } => {
-                let shown = self.sidebar.as_deref() == Some(name.as_str());
                 match method {
                     ObjectiveMethod::Remove => {
-                        self.titles.remove(&name);
-                        self.scores.remove(&name);
-                        if shown {
+                        for slot in self.numbered_slot(&name) {
+                            self.push_all(slot, &name, false, &mut applied);
+                        }
+                        if self.list.as_deref() == Some(name.as_str()) {
+                            self.list = None;
+                        }
+                        if self.below.as_deref() == Some(name.as_str()) {
+                            self.below = None;
+                        }
+                        applied.sidebar = self.sidebar.as_deref() == Some(name.as_str());
+                        if applied.sidebar {
                             self.sidebar = None;
                         }
+                        self.titles.remove(&name);
+                        self.scores.remove(&name);
                     }
                     _ => {
+                        applied.sidebar = self.sidebar.as_deref() == Some(name.as_str());
                         self.titles.insert(name, title);
                     }
                 }
-                shown
             }
-            Out::DisplaySlot { slot, objective } if slot == 1 => {
-                self.sidebar = (!objective.is_empty()).then_some(objective);
-                true
+            Out::DisplaySlot { slot, objective } => {
+                let new = (!objective.is_empty()).then_some(objective);
+                match slot {
+                    SLOT_SIDEBAR => {
+                        self.sidebar = new;
+                        applied.sidebar = true;
+                    }
+                    SLOT_LIST | SLOT_BELOW_NAME => {
+                        let number = slot as u8;
+                        let old = if slot == SLOT_LIST { &mut self.list } else { &mut self.below };
+                        let old = std::mem::replace(old, new.clone());
+                        if old != new {
+                            if let Some(old) = old {
+                                self.push_all(number, &old, false, &mut applied);
+                            }
+                            if let Some(new) = new {
+                                self.push_all(number, &new, true, &mut applied);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
-            Out::DisplaySlot { .. } => false,
             Out::Score { owner, objective, score, display, format } => {
-                let shown = self.sidebar.as_deref() == Some(objective.as_str());
+                applied.sidebar = self.sidebar.as_deref() == Some(objective.as_str());
+                for slot in self.numbered_slot(&objective) {
+                    applied.scores.push((slot, owner.clone(), Some(score)));
+                }
                 self.scores.entry(objective).or_default().insert(owner, (score, display, format));
-                shown
             }
             Out::ResetScore { owner, objective } => {
-                let shown = self.sidebar.as_deref() == Some(objective.as_str());
+                applied.sidebar = self.sidebar.as_deref() == Some(objective.as_str());
+                for slot in self.numbered_slot(&objective) {
+                    applied.scores.push((slot, owner.clone(), None));
+                }
                 if let Some(s) = self.scores.get_mut(&objective) {
                     s.remove(&owner);
                 }
-                shown
             }
-            _ => false,
+            _ => {}
         }
+        applied
     }
-}
 
-impl View {
     /// The sidebar objective's title and rows (text, right-hand value), as vanilla orders them:
     /// highest score first, equal scores by name, at most 15. The text is the line's display (else
     /// its owner); the right side is the number format's text, nothing for `blank`, else the score.
-    #[cfg_attr(not(feature = "horizon_main_api"), allow(dead_code))]
     fn sidebar_rows(&self) -> Option<(Value, Vec<(Value, Option<Value>)>)> {
         let name = self.sidebar.as_ref()?;
         let title = self.titles.get(name)?.clone();
@@ -415,14 +444,6 @@ impl View {
 }
 
 /// The viewer's sidebar from their objectives (`player_set_sidebar`).
-// HMOD-GAP(set_sidebar): the pinned SDK has no sidebar call; the objectives are still kept by
-// `View::apply`. With `horizon_main_api` the sidebar of Horizon main (#17948) shows them.
-#[cfg(not(feature = "horizon_main_api"))]
-fn sidebar(host: &mut dyn ServerHost, viewer: u128) {
-    let _ = (host, viewer);
-}
-
-#[cfg(feature = "horizon_main_api")]
 fn sidebar(host: &mut dyn ServerHost, viewer: u128) {
     let Some(player) = host.player(viewer) else { return };
     let rows = state().views.get(&viewer).and_then(View::sidebar_rows);
@@ -439,159 +460,71 @@ fn sidebar(host: &mut dyn ServerHost, viewer: u128) {
     let _ = player.set_sidebar(host, shown);
 }
 
-/// `TeamColor` index (0..15) to the chat colour name `team_set` takes.
-const COLORS: [&str; 16] = [
-    "black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray",
-    "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white",
-];
-
-#[cfg(feature = "horizon_main_api")]
-fn team_color(index: i32) -> Option<TeamColor> {
-    Some(match index {
-        0 => TeamColor::Black,
-        1 => TeamColor::DarkBlue,
-        2 => TeamColor::DarkGreen,
-        3 => TeamColor::DarkAqua,
-        4 => TeamColor::DarkRed,
-        5 => TeamColor::DarkPurple,
-        6 => TeamColor::Gold,
-        7 => TeamColor::Gray,
-        8 => TeamColor::DarkGray,
-        9 => TeamColor::Blue,
-        10 => TeamColor::Green,
-        11 => TeamColor::Aqua,
-        12 => TeamColor::Red,
-        13 => TeamColor::LightPurple,
-        14 => TeamColor::Yellow,
-        15 => TeamColor::White,
-        _ => return None,
-    })
-}
-
-/// A TAB team (name tags and sorting) as a team of the world's scoreboard.
-// HMOD-GAP(team_prefix_suffix): the pinned SDK has no scoreboard team calls at all, so the core's
-// team packets are dropped. With `horizon_main_api` (the teams of PR #17980) a team takes its
-// colour and members only: no prefix, suffix, name tag visibility, collision or friendly fire.
-#[cfg(not(feature = "horizon_main_api"))]
-fn team(host: &mut dyn ServerHost, name: &str, color: Option<i32>, players: Option<Vec<String>>) {
-    let _ = (host, name, color, players, COLORS);
-}
-
-#[cfg(feature = "horizon_main_api")]
-fn team(host: &mut dyn ServerHost, name: &str, color: Option<i32>, players: Option<Vec<String>>) {
-    let handle = match host.team(name) {
-        Some(handle) => handle,
-        None => match host.add_team(name) {
-            Ok(handle) => handle,
-            Err(_) => return,
-        },
-    };
-    let mut st = state();
-    // The core sends each viewer the same team, so only a change is applied.
-    if st.teams.get(name) != Some(&color) {
-        let _ = host.team_set_color(handle.clone(), color.and_then(team_color));
-        st.teams.insert(name.to_owned(), color);
-    }
-    for player in players.into_iter().flatten() {
-        if st.members.get(&player).map(String::as_str) != Some(name) {
-            let _ = host.team_join(handle.clone(), ScoreHolder::Name(player.clone()));
-            st.members.insert(player, name.to_owned());
-        }
+/// A number in the tab list (slot 0) or below a name (slot 2) for `viewer`
+/// (`player_set_display_score`); the owner is a player's name.
+fn display_score(host: &mut dyn ServerHost, viewer: u128, slot: u8, owner: &str, score: Option<i32>) {
+    let Some(viewer) = host.player(viewer) else { return };
+    let target = host
+        .players()
+        .server_players()
+        .into_iter()
+        .find(|p| p.name(&*host).is_some_and(|n| n.eq_ignore_ascii_case(owner)));
+    if let Some(target) = target {
+        let _ = host.player_set_display_score(viewer, slot, target, score);
     }
 }
 
-#[cfg(not(feature = "horizon_main_api"))]
-fn team_remove(host: &mut dyn ServerHost, name: &str) {
-    let _ = (host, name);
+/// TAB's team parameters as the packet's.
+fn team_parameters(host: &dyn ServerHost, params: &TeamParams) -> TeamParameters {
+    let mut team = TeamParameters::new();
+    team.display_name = text_json(host, &params.display_name);
+    team.prefix = text_json(host, &params.prefix);
+    team.suffix = text_json(host, &params.suffix);
+    team.name_tag_visibility = params.visibility;
+    team.collision_rule = params.collision;
+    team.color = params.color;
+    team.options = params.options;
+    team
 }
 
-#[cfg(feature = "horizon_main_api")]
-fn team_remove(host: &mut dyn ServerHost, name: &str) {
-    if let Some(handle) = host.team(name) {
-        let _ = host.team_remove(handle);
-    }
-    let mut st = state();
-    st.teams.remove(name);
-    st.members.retain(|_, team| team != name);
-    #[cfg(feature = "horizon_team_options_api")]
-    st.team_options.remove(name);
-}
-
-/// The team options of TAB's team packets beyond the colour: prefix, suffix, name tag visibility,
-/// collision rule and friendly fire (`team_set_prefix` and the setters of the branch
-/// `api-scoreboard-team-options`, #18817). Without the feature the packet's options are dropped.
-// HMOD-GAP(team_prefix_suffix): see `team` above; without `horizon_team_options_api` only the colour shows.
-#[cfg(not(feature = "horizon_team_options_api"))]
-fn team_options(host: &mut dyn ServerHost, name: &str, params: &TeamParams) {
-    let _ = (host, name, params);
-}
-
-#[cfg(feature = "horizon_team_options_api")]
-fn team_options(host: &mut dyn ServerHost, name: &str, params: &TeamParams) {
-    let Some(handle) = host.team(name) else {
-        return;
-    };
-    if state().team_options.get(name) == Some(params) {
-        return;
-    }
-    let prefix = text_json(&*host, &params.prefix);
-    let suffix = text_json(&*host, &params.suffix);
-    let _ = host.team_set_prefix(handle.clone(), prefix);
-    let _ = host.team_set_suffix(handle.clone(), suffix);
-    let _ = host.team_set_name_tag_visibility(handle.clone(), visibility_of(params.visibility));
-    let _ = host.team_set_collision_rule(handle.clone(), collision_of(params.collision));
-    let _ = host.team_set_friendly_fire(handle, (params.options & 1) != 0);
-    state().team_options.insert(name.to_owned(), params.clone());
-}
-
-/// `Team.Visibility` as TAB's number (0 always, 1 never, 2 hide for other teams, 3 hide for own team).
-#[cfg(feature = "horizon_team_options_api")]
-fn visibility_of(index: i32) -> TeamVisibility {
-    match index {
-        1 => TeamVisibility::Never,
-        2 => TeamVisibility::HideForOtherTeams,
-        3 => TeamVisibility::HideForOwnTeam,
-        _ => TeamVisibility::Always,
+/// A team as one viewer's client holds it (`ClientboundSetPlayerTeamPacket`, built by the game
+/// and sent to that viewer alone), so prefix, suffix, visibility, collision, friendly fire and
+/// seeing invisible teammates differ per viewer as TAB's do.
+fn team_packet(host: &mut dyn ServerHost, viewer: u128, spec: TeamPacketSpec) {
+    if let Ok(body) = host.team_packet_body(spec) {
+        send_raw(host, viewer, "minecraft:set_player_team", body);
     }
 }
 
-/// `Team.CollisionRule` as TAB's number (0 always, 1 never, 2 push other teams, 3 push own team).
-#[cfg(feature = "horizon_team_options_api")]
-fn collision_of(index: i32) -> TeamCollisionRule {
-    match index {
-        1 => TeamCollisionRule::Never,
-        2 => TeamCollisionRule::PushOtherTeams,
-        3 => TeamCollisionRule::PushOwnTeam,
-        _ => TeamCollisionRule::Always,
-    }
-}
-
-/// TAB's tab list names. The core sends them per viewer, `player_set_list_name` is the same for
-/// everyone, so only the name a player's own view gets is set (and only when it changed).
-// HMOD-GAP(set_list_name): the pinned SDK has no tab list name setter, so the core's names are not
-// sent; the `player_tab_list_name_format` hook still sets one name per player.
-#[cfg(not(feature = "horizon_main_api"))]
+/// TAB's tab list names, per viewer (`player_set_list_name_for`), and only when one changed.
 fn display_names(host: &mut dyn ServerHost, viewer: u128, entries: Vec<(u128, Option<Value>)>) {
-    let _ = (host, viewer, entries);
-}
-
-#[cfg(feature = "horizon_main_api")]
-fn display_names(host: &mut dyn ServerHost, viewer: u128, entries: Vec<(u128, Option<Value>)>) {
+    let Some(viewer_ref) = host.player(viewer) else { return };
     for (uuid, name) in entries {
-        if uuid != viewer {
-            continue;
-        }
         let key = name.as_ref().map(Value::to_string);
-        if state().list_names.get(&uuid) == Some(&key) {
+        if state().list_names.get(&(viewer, uuid)) == Some(&key) {
             continue;
         }
+        let Some(target) = host.player(uuid) else { continue };
         let text = name.as_ref().map(|json| text_json(&*host, json));
-        if let Some(player) = host.player(uuid) {
-            let _ = player.set_list_name(host, text);
-        }
-        state().list_names.insert(uuid, key);
+        let _ = host.player_set_list_name_for(viewer_ref, target, text);
+        state().list_names.insert((viewer, uuid), key);
     }
 }
+
+/// Has the engine hold the packets the guard rules on, once and only when TAB would use them.
+fn watch_guard(host: &mut dyn ServerHost) {
+    if state().watching || !api::guard_needed() {
+        return;
+    }
+    let ids = [crate::horizon_tab::guard::PLAYER_INFO_UPDATE, crate::horizon_tab::guard::SET_PLAYER_TEAM];
+    if host.watch_outgoing_packets(&ids, true) {
+        state().watching = true;
+    }
+}
+
+/// The toggle commands that share a vanilla command's name (`/bossbar` by default): the tree
+/// refuses them as usages, so `player_command` answers them.
+const VANILLA_TOGGLES: [&str; 1] = ["bossbar"];
 
 fn color_of(index: i32) -> Option<BossBarColor> {
     usize::try_from(index)
@@ -693,10 +626,9 @@ impl Hooks for Mod {
             log(&line);
         }
         log("ported: tab list header/footer, one list name per player, boss bars, chat, commands and placeholders.");
-        #[cfg(feature = "horizon_main_api")]
-        log("Shown: sidebar, list names, team colours, ping and game mode. Not shown: team prefixes/suffixes, below-name and list objectives.");
-        #[cfg(not(feature = "horizon_main_api"))]
-        log("Not shown yet: scoreboard teams (name tags, sorting), sidebar, below-name and list objectives, ping and game mode.");
+        log("Shown: header/footer, per-viewer list names, name tags and sorting (teams), sidebar, list and below-name numbers, ping and game mode, boss bars; the guard watches other senders' team, latency and game mode packets.");
+        // The permission groups the game's provider published answer TAB's group lookup.
+        crate::horizon_tab::integration::register(Box::new(crate::horizon_tab::integration::HostGroups));
     }
 
     /// Online names for a `<name:player_name>` slot of `/tab` (the registered usage is a word, which takes
@@ -752,8 +684,6 @@ impl Hooks for Mod {
             return Flow::Continue;
         };
         // `/tab`, the scoreboard and bossbar toggles: the roots the core registered.
-        // TODO(arismoko-api: command_replace_vanilla): a toggle named like a vanilla root (`/bossbar`
-        // by default) is not registered, so it is reached only as `/tab bossbar`.
         let ours = api::commands()
             .iter()
             .any(|(usage, _)| usage.split_whitespace().next() == Some(root.as_str()));
@@ -835,6 +765,21 @@ impl Hooks for Mod {
         }
         let present: HashSet<u128> = online.iter().map(|p| p.uuid()).collect();
         crate::horizon_tab::integration::host_permissions_retain(&present);
+        crate::horizon_tab::integration::host_groups_set(
+            online
+                .iter()
+                .map(|p| {
+                    let groups = host.permission_groups(p.uuid());
+                    (p.uuid(), groups.primary, groups.groups)
+                })
+                .collect(),
+        );
+        {
+            let mut st = state();
+            st.list_names.retain(|(viewer, _), _| present.contains(viewer));
+            st.views.retain(|viewer, _| present.contains(viewer));
+        }
+        watch_guard(host);
         let players: Vec<PlayerIn> = online
             .into_iter()
             .map(|player| player_in(&*host, player))
@@ -853,6 +798,48 @@ impl Hooks for Mod {
         };
         let packets = api::tick(now_ms(), server, players);
         send(host, packets);
+    }
+
+    /// Another sender's packets that undo TAB's: a team move, a ping or a game mode (anti-override).
+    fn server_packet(&self, _: &mut dyn ServerHost, event: &mut ServerPacketEvent<'_>) -> Flow {
+        match crate::horizon_tab::guard::rule(event.player, event.packet_id, event.body.as_slice()) {
+            crate::horizon_tab::guard::Verdict::Keep => Flow::Continue,
+            crate::horizon_tab::guard::Verdict::Cancel => Flow::Cancel,
+            crate::horizon_tab::guard::Verdict::Replace(body) => {
+                *event.body = body;
+                Flow::Continue
+            }
+        }
+    }
+
+    /// `/bossbar` (TAB's toggle command by default) is a vanilla command's name, so the command tree
+    /// would not take it as a usage: it is answered here, as the `bossbar` usages of `/tab` are.
+    fn player_command(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandEvent<'_>) -> Flow {
+        let line = event.command.trim_start_matches('/').trim().to_owned();
+        let root = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        let ours = VANILLA_TOGGLES.contains(&root.as_str())
+            && api::commands()
+                .iter()
+                .any(|(usage, _)| usage.split_whitespace().next() == Some(root.as_str()));
+        if !ours {
+            return Flow::Continue;
+        }
+        let Some(player) = host.player(event.player) else { return Flow::Continue };
+        let level = player.permission_level(&*host).unwrap_or(0);
+        let now = now_ms();
+        for node in api::command_permission_nodes() {
+            let answer = host_answer(host, event.player, &node);
+            api::host_permission_answer(event.player, &node, answer, now);
+        }
+        let answer = api::command(Some((event.player, level)), &line);
+        if !answer.ran {
+            return Flow::Continue;
+        }
+        for reply in answer.lines {
+            event.replies.push(text_json(&*host, &reply));
+        }
+        event.cancelled = true;
+        Flow::Cancel
     }
 
     fn player_respawned(&self, _: &mut dyn ServerHost, event: &mut PlayerRespawnedEvent<'_>) {
@@ -938,17 +925,55 @@ mod tests {
         assert_eq!(view.sidebar_rows().unwrap().1.len(), 15);
     }
 
-    // TAB's team numbers map to the vocabulary's variants, in TAB's order (0 is the default).
-    #[cfg(feature = "horizon_team_options_api")]
     #[test]
-    fn team_numbers_map_to_visibility_and_collision() {
-        assert_eq!(visibility_of(0), TeamVisibility::Always);
-        assert_eq!(visibility_of(1), TeamVisibility::Never);
-        assert_eq!(visibility_of(2), TeamVisibility::HideForOtherTeams);
-        assert_eq!(visibility_of(3), TeamVisibility::HideForOwnTeam);
-        assert_eq!(collision_of(0), TeamCollisionRule::Always);
-        assert_eq!(collision_of(1), TeamCollisionRule::Never);
-        assert_eq!(collision_of(2), TeamCollisionRule::PushOtherTeams);
-        assert_eq!(collision_of(3), TeamCollisionRule::PushOwnTeam);
+    fn list_and_below_name_slots_become_per_player_numbers() {
+        let mut view = View::default();
+        view.apply(Out::Objective {
+            name: "ping".into(),
+            method: ObjectiveMethod::Add,
+            title: json!("TAB"),
+            hearts: false,
+            format: None,
+        });
+        // A score before the slot is shown is only kept.
+        let applied = view.apply(Out::Score {
+            owner: "a".into(),
+            objective: "ping".into(),
+            score: 40,
+            display: None,
+            format: None,
+        });
+        assert!(applied.scores.is_empty());
+        // Showing the objective in the list slot sends what is kept.
+        let applied = view.apply(Out::DisplaySlot { slot: 0, objective: "ping".into() });
+        assert_eq!(applied.scores, vec![(0, "a".to_owned(), Some(40))]);
+        // A change and a reset go out for that slot.
+        let applied = view.apply(Out::Score {
+            owner: "a".into(),
+            objective: "ping".into(),
+            score: 55,
+            display: None,
+            format: None,
+        });
+        assert_eq!(applied.scores, vec![(0, "a".to_owned(), Some(55))]);
+        let applied = view.apply(Out::ResetScore { owner: "a".into(), objective: "ping".into() });
+        assert_eq!(applied.scores, vec![(0, "a".to_owned(), None)]);
+        // Removing the objective takes its numbers out of the slot.
+        view.apply(Out::Score {
+            owner: "b".into(),
+            objective: "ping".into(),
+            score: 7,
+            display: None,
+            format: None,
+        });
+        let applied = view.apply(Out::Objective {
+            name: "ping".into(),
+            method: ObjectiveMethod::Remove,
+            title: json!(""),
+            hearts: false,
+            format: None,
+        });
+        assert_eq!(applied.scores, vec![(0, "b".to_owned(), None)]);
+        assert!(view.list.is_none());
     }
 }

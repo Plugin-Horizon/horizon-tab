@@ -12,6 +12,7 @@ pub mod conditions;
 pub mod config;
 pub mod datefmt;
 pub mod engine;
+pub mod guard;
 pub mod integration;
 pub mod mysql;
 pub mod out;

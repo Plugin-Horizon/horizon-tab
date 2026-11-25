@@ -928,6 +928,8 @@ impl Hooks for Mod {
             memory_max_mb,
             version: SERVER_VERSION.to_owned(),
             level_name,
+            proxy_players: Vec::new(),
+            global: None,
         };
         let packets = api::tick(now_ms(), server, players);
         state().own_names.clear();

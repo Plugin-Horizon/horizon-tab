@@ -557,7 +557,8 @@ mod tests {
         let b = encode_to_proxy(&m);
         assert_eq!(decode_to_proxy(&b, true).unwrap(), m);
         // Without forward_group the group is not on the wire: the proxy reads the world and then the count.
-        let no_group = ToProxy::PlayerJoinResponse { group: None, ..m.clone() };
+        let ToProxy::PlayerJoinResponse { world, values, game_mode, .. } = m.clone() else { unreachable!() };
+        let no_group = ToProxy::PlayerJoinResponse { world, group: None, values, game_mode };
         assert_eq!(decode_to_proxy(&encode_to_proxy(&no_group), false).unwrap(), no_group);
         // The relational update names its target.
         let u = ToProxy::UpdatePlaceholder { identifier: "%rel_color%".into(), target: Some("Alex".into()), value: "&a".into() };

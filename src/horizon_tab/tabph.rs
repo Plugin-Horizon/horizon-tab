@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn deaths_invisible_collision_placeholders() {
-        let mut ph = ph();
+        let ph = ph();
         let mut t = player("Steve", 1);
         t.p.deaths = 7;
         t.p.invisible = true;

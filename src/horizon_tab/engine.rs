@@ -2354,11 +2354,11 @@ mod tests {
         assert_eq!(a[0].latency, 42);
         assert_eq!(a[0].order, i32::MAX - 1);
         assert_eq!(a[0].display["text"], "Hello");
-        // The players follow TAB's sorting (team name, then name); both show their own ping.
+        // Both have the same sorting characters, so TAB's unique team names (`checkTeamName`: A, B...)
+        // go by who was processed first: Steve's team sorts before Alex's, and the layout follows it.
         assert_eq!(a[1].latency, 25);
-        let mut names = vec![a[1].display["text"].clone(), a[2].display["text"].clone()];
-        names.sort_by_key(|n| n.to_string());
-        assert_eq!(names, vec!["Alex", "Steve"]);
+        assert_eq!(a[1].display["text"], "Steve");
+        assert_eq!(a[2].display["text"], "Alex");
         assert_eq!(a[3].display["text"], "");
         assert_eq!(a[3].latency, 500);
         assert!(mine.iter().any(|o| matches!(o, Out::Listed { ids, listed: false } if ids == &vec![1, 2])));

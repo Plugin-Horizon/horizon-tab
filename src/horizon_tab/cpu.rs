@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(l[0], " ");
         assert!(l.contains(&format!("&8&l{BAR} &7%ping% &8 (500)&7 - &e0.5%")));
         assert!(l.contains(&format!("&8&l{BAR} &7Layout &7(&e2%&7):")));
-        assert!(l.contains(&format!("&8&l{BAR} &6&lTotal: &e&l&e2%")));
+        assert!(l.contains(&format!("&8&l{BAR} &6&lTotal: &e&l&a2%")));
         let c = lines(&r, true, &|_| (500, true));
         assert!(c.contains(&format!("&8&l{BAR}     &7Updating - &e2%")));
     }

@@ -17,6 +17,7 @@
 
 
 pub mod horizon_tab;
+mod cmdkit;
 use crate::horizon_tab::api;
 use crate::horizon_tab::engine::PlayerIn;
 use crate::horizon_tab::listpacket;
@@ -886,10 +887,15 @@ impl Hooks for Mod {
         }
     }
 
+    fn register(&self, registrar: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
+        cmdkit::register(registrar);
+    }
+
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         for (usage, level) in api::commands() {
             // A word takes any name (an offline one too); `tab_complete` suggests the online names.
-            let usage = usage.replace(":player_name>", ":word>");
+            // A registered word, so the client asks the server and `tab_complete` offers the names.
+            let usage = usage.replace(":player_name>", ":tab:word>");
             event.commands.push(if level == 0 {
                 Command::new(&usage)
             } else {
@@ -923,6 +929,7 @@ impl Hooks for Mod {
                 CommandArgumentValue::Number(n) => n.to_string(),
                 CommandArgumentValue::Boolean(b) => b.to_string(),
                 CommandArgumentValue::Player(p) => p.name(&*host).unwrap_or_default(),
+                CommandArgumentValue::Custom { value, .. } => value.clone(),
                 _ => continue,
             };
             values.push(text);
@@ -1104,6 +1111,26 @@ impl Hooks for Mod {
         if let Some((_, link)) = REDIS.lock().unwrap_or_else(|e| e.into_inner()).take() {
             link.stop();
         }
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn the_sub_commands_of_the_original_are_in_the_tree() {
+        let usages: Vec<String> = api::commands().into_iter().map(|(u, _)| u).collect();
+        let paths = cmdkit::literal_paths(&usages);
+        for want in [
+            "tab reload", "tab groups", "tab debug", "tab cpu", "tab dump", "tab parse me", "tab mysql upload", "tab mysql download",
+            "tab setcollision true", "tab setcollision false", "tab player", "tab player remove", "tab playeruuid", "tab group", "tab group remove",
+            "tab scoreboard on", "tab scoreboard toggle", "tab bossbar off", "tab nametag hide", "tab nametag toggleview",
+        ] {
+            assert!(paths.iter().any(|p| p == want), "{want}");
+        }
+        let propertied = paths.iter().filter(|p| p.starts_with("tab player ") && p.split(' ').count() == 3).count();
+        assert!(propertied > 2, "the player properties are usages");
     }
 }
 

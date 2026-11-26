@@ -332,6 +332,13 @@ pub fn proxy_message(raw: &str) {
     }
 }
 
+/// `(type, channel name, redis url)` of the `proxy-support` feature, None when it is off.
+pub fn proxy_config() -> Option<(String, String, String)> {
+    let guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    let c = guard.as_ref()?.engine.cfg.proxy_support.as_ref()?;
+    Some((c.kind.clone(), c.channel.clone(), c.redis_url.clone()))
+}
+
 /// The `proxy-support` channel and the messages to send on it (None: the feature is off).
 pub fn proxy_outbox() -> Option<(String, Vec<String>)> {
     let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());

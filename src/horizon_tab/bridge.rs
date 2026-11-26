@@ -5,7 +5,7 @@
 //! With this half running, a TAB on Velocity gets this server's placeholder values, permission
 //! answers, world, game mode, vanish and invisibility state, and draws its scoreboard objects,
 //! teams and scores for the player through the backend. The transport (a plugin message to the
-//! player's connection) is the host's: see ENGINE_NEEDS `plugin_message_channel`.
+//! player's connection) is the glue's: `register_plugin_channel`, the `plugin_message` hook and `send_plugin_message` (round 8).
 
 use crate::horizon_tab::proxy::{write_utf, Reader};
 use std::collections::HashMap;

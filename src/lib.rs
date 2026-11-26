@@ -28,7 +28,7 @@ use mod_api::{
     LoopContext, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
     PermissionValueType, PlayerRef, PlayerRespawnedEvent, PlayerTabListNameFormatEvent,
     RegisterCommandsEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
-    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StatType, Suggestion, TabCompleteEvent,
+    PluginMessageEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StatType, Suggestion, TabCompleteEvent,
     Text,
 };
 use crate::horizon_tab::out::{NumberFmt, ObjectiveMethod, TeamParams};
@@ -730,6 +730,64 @@ fn boss(host: &mut dyn ServerHost, viewer: u128, id: u128, action: BossOut) {
     }
 }
 
+/// The Redis link of `proxy-support: REDIS`, with the settings it was opened for.
+static REDIS: LazyLock<Mutex<Option<(String, crate::horizon_tab::transport::Redis)>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Moves the bridge answers and the `proxy-support` messages: the bridge goes to the proxy through the
+/// player's connection (`tab:bridge-6`), `PLUGIN` support through a carrier player on its own channel (waiting
+/// when nobody is online), `REDIS` through pub/sub.
+fn transport(host: &mut dyn ServerHost) {
+    let bridge = api::bridge_outbox();
+    if !bridge.is_empty()
+        && let Ok(id) = Identifier::parse(crate::horizon_tab::bridge::CHANNEL)
+    {
+        for (uuid, bytes) in bridge {
+            if let Some(player) = host.player(uuid) {
+                let _ = player.send_plugin_message(&mut *host, &id, &bytes);
+            }
+        }
+    }
+    let config = api::proxy_config();
+    let mut redis = REDIS.lock().unwrap_or_else(|e| e.into_inner());
+    let wanted = config.as_ref().filter(|c| c.0 == "REDIS").map(|c| format!("{}\n{}", c.2, c.1));
+    if redis.as_ref().map(|r| &r.0) != wanted.as_ref() {
+        if let Some((_, old)) = redis.take() {
+            old.stop();
+        }
+        if let (Some(key), Some((_, name, url))) = (&wanted, &config) {
+            match crate::horizon_tab::transport::Redis::start(url, name) {
+                Ok(link) => *redis = Some((key.clone(), link)),
+                Err(e) => log(&format!("proxy-support REDIS: {e}")),
+            }
+        }
+    }
+    match &config {
+        Some((kind, _, _)) if kind == "REDIS" => {
+            if let Some((_, link)) = redis.as_ref() {
+                for raw in link.drain() {
+                    api::proxy_message(&raw);
+                }
+                if let Some((_, messages)) = api::proxy_outbox() {
+                    for m in messages {
+                        link.send(m);
+                    }
+                }
+            }
+        }
+        Some((_, name, _)) => {
+            // PLUGIN: messages wait in the engine's outbox only while nobody can carry them.
+            let Some(carrier) = host.players().server_players().first().copied() else { return };
+            let Ok(id) = Identifier::parse(&crate::horizon_tab::transport::plugin_channel(name)) else { return };
+            if let Some((_, messages)) = api::proxy_outbox() {
+                for m in messages {
+                    let _ = carrier.send_plugin_message(&mut *host, &id, m.as_bytes());
+                }
+            }
+        }
+        None => {}
+    }
+}
+
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
     fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
@@ -761,6 +819,32 @@ impl Hooks for Mod {
         log("Shown: header/footer, per-viewer list names, name tags and sorting (teams), sidebar, list and below-name numbers, ping and game mode, boss bars; the guard watches other senders' team, latency and game mode packets.");
         // The permission groups the game's provider published answer TAB's group lookup.
         crate::horizon_tab::integration::register(Box::new(crate::horizon_tab::integration::HostGroups));
+        // The proxy's TAB talks to this backend on `tab:bridge-6`; `proxy-support: PLUGIN` has its own channel.
+        if let Ok(id) = Identifier::parse(crate::horizon_tab::bridge::CHANNEL) {
+            let _ = host.register_plugin_channel(&id);
+        }
+        if let Some((kind, name, _)) = api::proxy_config()
+            && kind == "PLUGIN"
+            && let Ok(id) = Identifier::parse(&crate::horizon_tab::transport::plugin_channel(&name))
+        {
+            let _ = host.register_plugin_channel(&id);
+        }
+    }
+
+    fn plugin_message(&self, _: &mut dyn ServerHost, event: &mut PluginMessageEvent<'_>) {
+        if !api::started() {
+            return;
+        }
+        let channel = event.channel.to_string();
+        if channel == crate::horizon_tab::bridge::CHANNEL {
+            api::bridge_message(event.player, event.data);
+        } else if let Some((kind, name, _)) = api::proxy_config()
+            && kind == "PLUGIN"
+            && channel == crate::horizon_tab::transport::plugin_channel(&name)
+        {
+            // The message is Base64 text; every proxy-support message arrives as one string.
+            api::proxy_message(&String::from_utf8_lossy(event.data));
+        }
     }
 
     /// Online names for a `<name:player_name>` slot of `/tab` (the registered usage is a word, which takes
@@ -934,6 +1018,7 @@ impl Hooks for Mod {
         let packets = api::tick(now_ms(), server, players);
         state().own_names.clear();
         send(host, packets);
+        transport(host);
         opaque_sight(host);
     }
 
@@ -1009,6 +1094,9 @@ impl Hooks for Mod {
     fn server_stopping(&self, host: &mut dyn ServerHost, _: &mut ServerStoppingEvent) {
         let packets = api::stop();
         send(host, packets);
+        if let Some((_, link)) = REDIS.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            link.stop();
+        }
     }
 }
 

@@ -161,6 +161,8 @@ pub struct ProxySupportCfg {
     /// `TAB_4_<channel-name-suffix>`.
     pub channel: String,
     pub plugin_name: String,
+    /// `proxy-support.redis.url`.
+    pub redis_url: String,
 }
 
 /// Key paths (`*` = any key) of the files TAB keeps that the port reads. `check_original` compares the
@@ -507,6 +509,7 @@ impl Config {
                 kind,
                 channel: crate::horizon_tab::proxy::channel_name(&ps.get("channel-name-suffix").str_or("custom")),
                 plugin_name: ps.at(&["plugin", "name"]).str_or("RedisBungee"),
+                redis_url: ps.at(&["redis", "url"]).str_or("redis://:password@localhost:6379/0"),
             });
         }
         cfg

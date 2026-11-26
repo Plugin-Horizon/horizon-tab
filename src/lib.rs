@@ -730,6 +730,11 @@ fn boss(host: &mut dyn ServerHost, viewer: u128, id: u128, action: BossOut) {
     }
 }
 
+/// The one place a plugin message leaves through a player's connection (`PlayerRef::send_plugin_message`).
+fn send_plugin_message(host: &mut dyn ServerHost, player: PlayerRef, id: &Identifier, data: &[u8]) -> bool {
+    player.send_plugin_message(&mut *host, id, data).is_ok()
+}
+
 /// The Redis link of `proxy-support: REDIS`, with the settings it was opened for.
 static REDIS: LazyLock<Mutex<Option<(String, crate::horizon_tab::transport::Link)>>> = LazyLock::new(|| Mutex::new(None));
 
@@ -743,7 +748,7 @@ fn transport(host: &mut dyn ServerHost) {
     {
         for (uuid, bytes) in bridge {
             if let Some(player) = host.player(uuid) {
-                let _ = host.player_send_plugin_message(player, &id, &bytes);
+                let _ = send_plugin_message(host, player, &id, &bytes);
             }
         }
     }
@@ -782,7 +787,7 @@ fn transport(host: &mut dyn ServerHost) {
             let Ok(id) = Identifier::parse(&crate::horizon_tab::transport::plugin_channel(name)) else { return };
             if let Some((_, messages)) = api::proxy_outbox() {
                 for m in messages {
-                    let _ = host.player_send_plugin_message(carrier, &id, m.as_bytes());
+                    let _ = send_plugin_message(host, carrier, &id, m.as_bytes());
                 }
             }
         }
@@ -809,7 +814,7 @@ impl Hooks for Mod {
         let _ = event.nodes.add(bypass, NodeDefault::Level(PermissionLevel::from_level(1)));
     }
 
-    fn server_about_to_start(&self, _: &mut dyn ServerHost, _: &mut ServerAboutToStartEvent) {
+    fn server_about_to_start(&self, host: &mut dyn ServerHost, _: &mut ServerAboutToStartEvent) {
         if api::started() {
             return;
         }

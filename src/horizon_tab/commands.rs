@@ -7,8 +7,8 @@ use crate::horizon_tab::integration;
 use crate::horizon_tab::out::{Out, Packet};
 use crate::horizon_tab::properties::VALID_PROPERTIES;
 
-/// The TAB version whose commands this follows (shown by `/tab`).
-const TAB_VERSION: &str = "6.2.2-SNAPSHOT";
+/// The TAB version `/tab` shows: the jar the Paper servers run.
+const TAB_VERSION: &str = "6.2.1";
 
 /// `PropertyConfiguration.VALID_PROPERTIES` in TAB's order.
 pub const COMMAND_PROPERTIES: [&str; 5] = ["tagprefix", "tagsuffix", "tabprefix", "customtabname", "tabsuffix"];
@@ -1222,6 +1222,14 @@ mod tests {
         assert!(out.contains("    url: '*CENSORED*'\n"));
         assert!(out.contains("  port: 3306\n") && out.contains("  type: PLUGIN\n") && out.contains("\nhost: keep\n"));
         assert!(!out.contains("db.internal") && !out.contains("redis://x"));
+    }
+
+    #[test]
+    fn tab_shows_the_version_of_the_paper_jar() {
+        // Paper: "TAB v6.2.1" heads the help menu.
+        let mut e = engine();
+        let o = tab(&mut e, Sender::Console, "");
+        assert_eq!(o.replies[0], "&3TAB v6.2.1");
     }
 
     #[test]

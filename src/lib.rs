@@ -743,7 +743,7 @@ fn transport(host: &mut dyn ServerHost) {
     {
         for (uuid, bytes) in bridge {
             if let Some(player) = host.player(uuid) {
-                let _ = player.send_plugin_message(&mut *host, &id, &bytes);
+                let _ = host.player_send_plugin_message(player, &id, &bytes);
             }
         }
     }
@@ -782,7 +782,7 @@ fn transport(host: &mut dyn ServerHost) {
             let Ok(id) = Identifier::parse(&crate::horizon_tab::transport::plugin_channel(name)) else { return };
             if let Some((_, messages)) = api::proxy_outbox() {
                 for m in messages {
-                    let _ = carrier.send_plugin_message(&mut *host, &id, m.as_bytes());
+                    let _ = host.player_send_plugin_message(carrier, &id, m.as_bytes());
                 }
             }
         }

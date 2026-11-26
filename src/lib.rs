@@ -731,7 +731,7 @@ fn boss(host: &mut dyn ServerHost, viewer: u128, id: u128, action: BossOut) {
 }
 
 /// The Redis link of `proxy-support: REDIS`, with the settings it was opened for.
-static REDIS: LazyLock<Mutex<Option<(String, crate::horizon_tab::transport::Redis)>>> = LazyLock::new(|| Mutex::new(None));
+static REDIS: LazyLock<Mutex<Option<(String, crate::horizon_tab::transport::Link)>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Moves the bridge answers and the `proxy-support` messages: the bridge goes to the proxy through the
 /// player's connection (`tab:bridge-6`), `PLUGIN` support through a carrier player on its own channel (waiting
@@ -749,20 +749,22 @@ fn transport(host: &mut dyn ServerHost) {
     }
     let config = api::proxy_config();
     let mut redis = REDIS.lock().unwrap_or_else(|e| e.into_inner());
-    let wanted = config.as_ref().filter(|c| c.0 == "REDIS").map(|c| format!("{}\n{}", c.2, c.1));
+    let wanted = config.as_ref().filter(|c| c.0 != "PLUGIN").map(|c| format!("{}\n{}\n{}\n{}", c.0, c.2, c.1, c.3));
     if redis.as_ref().map(|r| &r.0) != wanted.as_ref() {
         if let Some((_, old)) = redis.take() {
             old.stop();
         }
-        if let (Some(key), Some((_, name, url))) = (&wanted, &config) {
-            match crate::horizon_tab::transport::Redis::start(url, name) {
+        if let (Some(key), Some((kind, name, url, exchange))) = (&wanted, &config) {
+            use crate::horizon_tab::transport::{Link, Rabbit, Redis};
+            let link = if kind == "RABBITMQ" { Rabbit::start(url, exchange, name).map(Link::Rabbit) } else { Redis::start(url, name).map(Link::Redis) };
+            match link {
                 Ok(link) => *redis = Some((key.clone(), link)),
-                Err(e) => log(&format!("proxy-support REDIS: {e}")),
+                Err(e) => log(&format!("proxy-support {kind}: {e}")),
             }
         }
     }
     match &config {
-        Some((kind, _, _)) if kind == "REDIS" => {
+        Some((kind, _, _, _)) if kind != "PLUGIN" => {
             if let Some((_, link)) = redis.as_ref() {
                 for raw in link.drain() {
                     api::proxy_message(&raw);
@@ -774,7 +776,7 @@ fn transport(host: &mut dyn ServerHost) {
                 }
             }
         }
-        Some((_, name, _)) => {
+        Some((_, name, _, _)) => {
             // PLUGIN: messages wait in the engine's outbox only while nobody can carry them.
             let Some(carrier) = host.players().server_players().first().copied() else { return };
             let Ok(id) = Identifier::parse(&crate::horizon_tab::transport::plugin_channel(name)) else { return };
@@ -823,7 +825,7 @@ impl Hooks for Mod {
         if let Ok(id) = Identifier::parse(crate::horizon_tab::bridge::CHANNEL) {
             let _ = host.register_plugin_channel(&id);
         }
-        if let Some((kind, name, _)) = api::proxy_config()
+        if let Some((kind, name, _, _)) = api::proxy_config()
             && kind == "PLUGIN"
             && let Ok(id) = Identifier::parse(&crate::horizon_tab::transport::plugin_channel(&name))
         {
@@ -838,7 +840,7 @@ impl Hooks for Mod {
         let channel = event.channel.to_string();
         if channel == crate::horizon_tab::bridge::CHANNEL {
             api::bridge_message(event.player, event.data);
-        } else if let Some((kind, name, _)) = api::proxy_config()
+        } else if let Some((kind, name, _, _)) = api::proxy_config()
             && kind == "PLUGIN"
             && channel == crate::horizon_tab::transport::plugin_channel(&name)
         {

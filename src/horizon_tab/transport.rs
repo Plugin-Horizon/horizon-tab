@@ -103,6 +103,96 @@ fn publish(client: &redis::Client, channel: &str, rx: &Receiver<String>, stop: &
     }
 }
 
+/// A RabbitMQ link: one fanout exchange, each instance with its own exclusive queue bound to it. The thread
+/// owns a current-thread tokio runtime and reconnects every five seconds after an error.
+pub struct Rabbit {
+    out: tokio::sync::mpsc::UnboundedSender<String>,
+    inbox: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Rabbit {
+    pub fn start(url: &str, exchange: &str, channel: &str) -> Result<Rabbit, String> {
+        if !url.starts_with("amqp://") && !url.starts_with("amqps://") {
+            return Err(format!("rabbitmq: `{url}` is not an AMQP URI"));
+        }
+        let (out, mut orx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let inbox = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (url, exchange, channel) = (url.to_owned(), exchange.to_owned(), channel.to_owned());
+        let (inb, flag) = (inbox.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            rt.block_on(async move {
+                use lapin::options::{BasicGetOptions, BasicPublishOptions, ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions};
+                use lapin::types::FieldTable;
+                while !flag.load(Ordering::Relaxed) {
+                    let attempt = async {
+                        let conn = lapin::Connection::connect(&url, lapin::ConnectionProperties::default()).await?;
+                        let ch = conn.create_channel().await?;
+                        ch.exchange_declare(exchange.as_str().into(), lapin::ExchangeKind::Fanout, ExchangeDeclareOptions { durable: false, ..Default::default() }, FieldTable::default()).await?;
+                        let q = ch.queue_declare("".into(), QueueDeclareOptions { durable: false, exclusive: true, auto_delete: true, ..Default::default() }, FieldTable::default()).await?;
+                        ch.queue_bind(q.name().clone(), exchange.as_str().into(), channel.as_str().into(), QueueBindOptions::default(), FieldTable::default()).await?;
+                        while !flag.load(Ordering::Relaxed) {
+                            while let Ok(m) = orx.try_recv() {
+                                ch.basic_publish(exchange.as_str().into(), channel.as_str().into(), BasicPublishOptions::default(), m.as_bytes(), lapin::BasicProperties::default()).await?;
+                            }
+                            while let Some(m) = ch.basic_get(q.name().clone(), BasicGetOptions { no_ack: true }).await? {
+                                inb.lock().unwrap_or_else(|e| e.into_inner()).push(String::from_utf8_lossy(&m.data).into_owned());
+                            }
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                        Ok::<(), lapin::Error>(())
+                    };
+                    if attempt.await.is_err() {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            });
+        });
+        Ok(Rabbit { out, inbox, stop })
+    }
+
+    pub fn send(&self, message: String) {
+        let _ = self.out.send(message);
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        std::mem::take(&mut *self.inbox.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The running broker link, whichever kind.
+pub enum Link {
+    Redis(Redis),
+    Rabbit(Rabbit),
+}
+
+impl Link {
+    pub fn send(&self, message: String) {
+        match self {
+            Link::Redis(l) => l.send(message),
+            Link::Rabbit(l) => l.send(message),
+        }
+    }
+    pub fn drain(&self) -> Vec<String> {
+        match self {
+            Link::Redis(l) => l.drain(),
+            Link::Rabbit(l) => l.drain(),
+        }
+    }
+    pub fn stop(&self) {
+        match self {
+            Link::Redis(l) => l.stop(),
+            Link::Rabbit(l) => l.stop(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +201,15 @@ mod tests {
     fn plugin_channel_is_a_valid_identifier() {
         assert_eq!(plugin_channel("TAB_4_net"), "tab:tab_4_net");
         assert_eq!(plugin_channel("TAB_4_my suffix!"), "tab:tab_4_my_suffix_");
+    }
+
+    #[test]
+    fn a_rabbitmq_uri_is_checked_and_an_unreachable_broker_stays_quiet() {
+        assert!(Rabbit::start("localhost", "plugin", "TAB_4_net").is_err());
+        let r = Rabbit::start("amqp://guest:guest@127.0.0.1:1/%2F", "plugin", "TAB_4_net").unwrap();
+        r.send("x".into());
+        assert!(r.drain().is_empty());
+        r.stop();
     }
 
     #[test]

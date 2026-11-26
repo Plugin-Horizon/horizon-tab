@@ -163,6 +163,9 @@ pub struct ProxySupportCfg {
     pub plugin_name: String,
     /// `proxy-support.redis.url`.
     pub redis_url: String,
+    /// `proxy-support.rabbitmq.url` (an AMQP URI) and `.exchange`.
+    pub rabbitmq_url: String,
+    pub rabbitmq_exchange: String,
 }
 
 /// Key paths (`*` = any key) of the files TAB keeps that the port reads. `check_original` compares the
@@ -510,6 +513,8 @@ impl Config {
                 channel: crate::horizon_tab::proxy::channel_name(&ps.get("channel-name-suffix").str_or("custom")),
                 plugin_name: ps.at(&["plugin", "name"]).str_or("RedisBungee"),
                 redis_url: ps.at(&["redis", "url"]).str_or("redis://:password@localhost:6379/0"),
+                rabbitmq_url: ps.at(&["rabbitmq", "url"]).str_or("amqp://guest:guest@localhost:5672/%2F"),
+                rabbitmq_exchange: ps.at(&["rabbitmq", "exchange"]).str_or("plugin"),
             });
         }
         cfg

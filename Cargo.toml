@@ -14,3 +14,6 @@ mysql = { version = "28", default-features = false, features = ["minimal-rust", 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # `proxy-support.type: REDIS` (pub/sub): the crate husksync and luckperms use.
 redis = { version = "1", default-features = false, features = ["tls-rustls", "sentinel"] }
+# `proxy-support.type: RABBITMQ`: lapin on its own thread, as luckperms does.
+lapin = { version = "4", default-features = false, features = ["tokio", "rustls--ring"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync"] }

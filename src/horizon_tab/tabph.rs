@@ -101,6 +101,7 @@ fn builtin_interval(token: &str) -> Option<i64> {
         "%memory-used%" | "%memory-used-gb%" | "%health%" => 200,
         "%staffonline%" | "%nonstaffonline%" => 2000,
         "%gamemode%" | "%mspt%" => 1000,
+        t if t.starts_with("%online_") || t.starts_with("%playerlist-group_") => 1000,
         _ => return None,
     })
 }
@@ -123,11 +124,13 @@ fn server_wide(token: &str) -> bool {
             | "%serveronline%"
     ) || token.starts_with("%server_")
         || token.starts_with("%online_")
+        || token.starts_with("%playerlist-group_")
 }
 
 pub struct TabPlaceholders {
     pub date_format: String,
     pub time_format: String,
+    pub locale: String,
     pub time_offset_hours: f64,
     pub replacements: Vec<(String, Vec<(String, String)>)>,
     pub default_refresh_ms: i64,
@@ -136,6 +139,9 @@ pub struct TabPlaceholders {
     pub conditions: HashMap<String, Condition>,
     pub now_ms: i64,
     cache: RefCell<HashMap<(u128, String), (String, i64)>>,
+    /// `/tab cpu`: nanoseconds spent per placeholder while tracking.
+    timings: RefCell<HashMap<String, u64>>,
+    pub track: std::cell::Cell<bool>,
 }
 
 const MAX_DEPTH: usize = 8;
@@ -145,6 +151,7 @@ impl TabPlaceholders {
         TabPlaceholders {
             date_format: cfg.date_format.clone(),
             time_format: cfg.time_format.clone(),
+            locale: cfg.locale.clone(),
             time_offset_hours: cfg.time_offset_hours,
             replacements: cfg.replacements.clone(),
             default_refresh_ms: cfg.default_refresh_ms,
@@ -162,7 +169,19 @@ impl TabPlaceholders {
                 .collect(),
             now_ms: 0,
             cache: RefCell::new(HashMap::new()),
+            timings: RefCell::new(HashMap::new()),
+            track: std::cell::Cell::new(false),
         }
+    }
+
+    /// The nanoseconds each placeholder took since the last call (`/tab cpu`).
+    pub fn take_timings(&self) -> HashMap<String, u64> {
+        std::mem::take(&mut *self.timings.borrow_mut())
+    }
+
+    /// A placeholder's refresh interval in ms and whether the config sets it.
+    pub fn refresh_info(&self, token: &str) -> (i64, bool) {
+        (self.interval(token), self.refresh_ms.contains_key(token))
     }
 
     /// Forgets a player's cached values (when they leave).
@@ -229,6 +248,22 @@ impl TabPlaceholders {
         let Some((_, rules)) = self.replacements.iter().find(|(k, _)| k == token) else {
             return value;
         };
+        self.apply_rules(rules, value, ctx, depth)
+    }
+
+    /// `parse`, then the output replacements a proxy sent for the token when this server has none of its own.
+    pub fn parse_with_rules(&self, token: &str, ctx: &Ctx, extra: &[(String, Vec<(String, String)>)]) -> String {
+        let value = self.parse(token, ctx);
+        if self.replacements.iter().any(|(k, _)| k == token) {
+            return value;
+        }
+        match extra.iter().find(|(k, _)| k == token) {
+            Some((_, rules)) => self.apply_rules(rules, value, ctx, 0),
+            None => value,
+        }
+    }
+
+    fn apply_rules(&self, rules: &[(String, String)], value: String, ctx: &Ctx, depth: usize) -> String {
         let colored = text::colorize(&value);
         let mut chosen: Option<&String> = rules.iter().find(|(k, _)| text::colorize(k) == colored).map(|(_, v)| v);
         if chosen.is_none() {
@@ -291,7 +326,12 @@ impl TabPlaceholders {
                 return Some(v.clone());
             }
         }
-        let v = self.compute(token, inner, ctx)?;
+        let started = self.track.get().then(std::time::Instant::now);
+        let v = self.compute(token, inner, ctx);
+        if let Some(at) = started {
+            *self.timings.borrow_mut().entry(token.to_owned()).or_insert(0) += at.elapsed().as_nanos() as u64;
+        }
+        let v = v?;
         self.cache.borrow_mut().insert(key, (v.clone(), self.now_ms));
         Some(v)
     }
@@ -326,12 +366,17 @@ impl TabPlaceholders {
             "%bedrock%" => t.bedrock.to_string(),
             "%player-version%" => t.version_name.clone(),
             "%player-version-id%" => t.version_id.to_string(),
-            "%online%" | "%serveronline%" => visible().count().to_string(),
+            "%online%" => (visible().count() + ctx.server.proxy_players.iter().filter(|r| !r.vanished).count()).to_string(),
+            "%serveronline%" => (visible().count()
+                + ctx.server.proxy_players.iter().filter(|r| !r.vanished && r.server.eq_ignore_ascii_case(&ctx.server.level_name)).count())
+            .to_string(),
             "%worldonline%" => visible().filter(|o| o.p.world == p.world).count().to_string(),
-            "%staffonline%" => visible().filter(|o| staff(*o)).count().to_string(),
+            "%staffonline%" => (visible().filter(|o| staff(*o)).count()
+                + ctx.server.proxy_players.iter().filter(|r| !r.vanished && r.staff).count())
+            .to_string(),
             "%nonstaffonline%" => visible().filter(|o| !staff(*o)).count().to_string(),
-            "%time%" => crate::horizon_tab::datefmt::format(&self.time_format, &self.now_local()),
-            "%date%" => crate::horizon_tab::datefmt::format(&self.date_format, &self.now_local()),
+            "%time%" => crate::horizon_tab::datefmt::format_locale(&self.time_format, &self.now_local(), &self.locale),
+            "%date%" => crate::horizon_tab::datefmt::format_locale(&self.date_format, &self.now_local(), &self.locale),
             "%memory-used%" => ctx.server.memory_used_mb.to_string(),
             "%memory-max%" => ctx.server.memory_max_mb.to_string(),
             "%memory-used-gb%" => builtin::two_decimals(ctx.server.memory_used_mb as f64 / 1024.0),
@@ -347,11 +392,23 @@ impl TabPlaceholders {
                 .unwrap_or_default(),
             _ => {
                 if let Some(server) = inner.strip_prefix("online_") {
-                    // One server here: its own name counts its players.
-                    if server.eq_ignore_ascii_case(&ctx.server.level_name) {
-                        return Some(visible().count().to_string());
-                    }
-                    return Some("0".into());
+                    // This server's own name counts the players here; the others come from the
+                    // players other TAB instances announced (`proxy-support`).
+                    let here = if server.eq_ignore_ascii_case(&ctx.server.level_name) { visible().count() } else { 0 };
+                    let remote = ctx
+                        .server
+                        .proxy_players
+                        .iter()
+                        .filter(|r| !r.vanished && r.server.eq_ignore_ascii_case(server))
+                        .count();
+                    return Some((here + remote).to_string());
+                }
+                if let Some(group) = inner.strip_prefix("playerlist-group_") {
+                    // `GlobalPlayerList`'s group counters: only with the feature on.
+                    let g = ctx.server.global.as_ref()?;
+                    let local = visible().map(|_| (ctx.server.level_name.clone(), false));
+                    let remote = ctx.server.proxy_players.iter().map(|r| (r.server.clone(), r.vanished));
+                    return Some(g.group_count(group, local.chain(remote)).to_string());
                 }
                 return placeholders::resolve(Some(p), ctx.server, inner);
             }
@@ -454,7 +511,7 @@ mod tests {
 
     #[test]
     fn deaths_invisible_collision_placeholders() {
-        let mut ph = ph();
+        let ph = ph();
         let mut t = player("Steve", 1);
         t.p.deaths = 7;
         t.p.invisible = true;

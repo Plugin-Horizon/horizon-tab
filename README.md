@@ -2,7 +2,7 @@
 
 ## Port status
 
-Compared with TAB 6.2.2-SNAPSHOT (7d62062) (estimate): **37 %** of the original's commands, permissions, config keys, messages and features work today; **37 %** once our open Horizon PRs are merged; **46 %** with the engine changes we are writing; **40 %** with the newest Horizon SDK. Estimated count: 42/115 items. Status: not yet compiled after the 2026-11-20 round.
+Item list: audit/rec100/tab.md (round 5, 2026-11-25: 41 of 44 items work, 2 are built up to the transport (engine), 1 is n/a (removed); nothing is open; the code is written against the combined next SDK and was not compiled yet). Earlier estimates below are superseded.
 
 > **Unofficial Rust port of TAB for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the TAB authors.**
 
@@ -41,10 +41,15 @@ to players yet; see Known gaps.
   `%server_tps_1_colored%`, a mod's `%coins_balance%`) comes from the registry.
 - Formatting: `&` codes, `&#RRGGBB`, `{#RRGGBB}`, `#<RRGGBB>`, `&x&R&R&G&G&B&B`, TAB's gradients
   (`<#RRGGBB>text</#RRGGBB>`, `{#RRGGBB>}text{#RRGGBB<}`, `<$#RRGGBB>text<$#RRGGBB>`,
-  `<gradient:#RRGGBB>text</gradient:#RRGGBB>`) and, with `components.minimessage-support`, common MiniMessage tags.
+  `<gradient:#RRGGBB>text</gradient:#RRGGBB>`) and, with `components.minimessage-support`, MiniMessage: colours,
+  decorations, `<reset>`, `<newline>`, `<gradient>`, `<rainbow>`, `<transition>`, `<pride>`, `<shadow>`, `<font>`,
+  `<insertion>`, `<click>`, `<hover>`, `<key>`, `<lang>`, `<selector>`, `<score>`, `<nbt>` and `\<` escapes (`mm.rs`).
+- Features of round 4: `layout` (fake tab-list entries per viewer, fixed slots, groups, COLUMNS/ROWS), `per-world-playerlist`,
+  opaque name tags (`/tab nametag opaque|opaqueview`, line of sight), nick-plugin compatibility (a renamed entry moves the
+  team member and the scores), `placeholders.locale` (en, de, fr, es, it, nl, pt, sv, pl).
 - Commands, as TAB 6.2.2 has them: `/tab reload | parse | player | playeruuid | group | groups | debug | dump | cpu |
   mysql | scoreboard | bossbar | nametag | setcollision` and the scoreboard toggle command (`/sb`), with TAB's
-  permission nodes (`tab.admin` allows all). `cpu` and `dump` need parts that are not ported, see the Known gaps section.
+  permission nodes (`tab.admin` allows all). `/tab cpu` times the engine's stages and the placeholders for ten seconds and prints TAB's report; `/tab dump <player>` writes `plugins/TAB/dump/<player>-<time>.txt` (nothing is uploaded).
 
 What is ported and what is not: the Known gaps section. What Horizon would need to do it without internals:
 the Known gaps section.
@@ -86,18 +91,18 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+Round 4 (2026-11-25) closed the list of open items; what stays out, and why:
 
-- With the Cargo feature `horizon_main_api` (needs a Horizon build that has the calls of main and PR #17980; off by default) ping, nickname, vanished, the sidebar, list names (the player's own view) and team colours and members work; the rest of this list stays.
-- With `horizon_team_options_api` (needs `horizon_main_api` and the team setters of branch `api-scoreboard-team-options`, PR #17980 stack) team prefixes, suffixes, name tag visibility, collision rules and friendly fire are set. With `horizon_protocol_api` (branch `api-player-protocol`) `%player-version%` shows the client's version. Both are off by default and were written without a compile.
-- Without `horizon_team_options_api`, scoreboard teams show the colour only (no name tag prefix/suffix, visibility or collision, no team sorting); without `horizon_main_api` they show nothing. The sidebar and the tab-list and below-name objective slots are dropped; ping and game mode are not sent.
-- The anti-override guard is off (outgoing packets cannot be watched), so other senders' team, latency or name packets are not put back.
-- `%player-version%` is wrong without `horizon_protocol_api` (no protocol read). Player-name arguments of `/tab` complete online names, only for senders with `tab.tabcomplete`; the literal sub-command words are not filtered per sender. An offline name is still accepted as typed.
-- A toggle named like a vanilla command (`/bossbar`) is only reachable as `/tab bossbar`.
-- List names are per player, not per viewer.
-- MySQL storage (`mysql.enabled`) is blind-written and not compiled yet. Its database calls run on the server thread (TAB uses a
-  thread of its own), so a join or an upload waits for them. `/tab dump` does not show the `mysql` section. Rows with
-  unknown properties get no `checkProperty` warning.
+- `proxy-support`, `global-playerlist`, `%online_<server>%` and the `tab:bridge-6` bridge (round 5): the logic is in the mod and tested (`proxy.rs`: TAB's ProxySupport messages, the remote-player directory, server groups and `shouldSee`; `bridge.rs` and `Engine::bridge_*`: the backend half of the proxy bridge). The transports (round 8, uncompiled until the queue builds them): `tab:bridge-6` and the `PLUGIN` support channel (`tab:<TAB_4_suffix>` lower-cased) run on `register_plugin_channel`, the `plugin_message` hook and `send_plugin_message` (the carrier is the first online player; messages wait while nobody is online); `REDIS` runs on the redis crate (`transport.rs`, pub/sub on the `TAB_4_<suffix>` channel with the Base64 line as payload). `RABBITMQ` runs on lapin (`transport.rs`: a fanout exchange named by `rabbitmq.exchange`, an exclusive queue per instance, the Base64 line as body). Neither broker link was checked against a second TAB instance (delivery4j's framing is not in the source tree).
+- Unlimited name tags (armor stands): removed from TAB before 6.2.2 (its LegacyConverter deletes the option); nothing to port.
+- `/tab dump` writes a local file; the upload to a paste service is not done (the dump holds player names, ids and the config).
+- The help menu has no hover or click events in TAB 6.2.2; a `help-menu` in `messages.yml` that uses `<click>` or `<hover>` works through the MiniMessage module.
+- Layout skins: `signed_texture:<value>;<signature>` and `player:<online name>` are resolved; `mineskin:`, `texture:` and `player:` of players who are not online need TAB's web lookups and skin cache, so those slots show the client's default skin (TAB's own result when a source fails).
+- `per-world-playerlist` regex world patterns support literals, `.`, classes, `\d \w \s`, `* + ?` and `|`; a pattern with groups or counted repeats is compared as a literal (TAB's own fallback for an invalid regex).
+- MiniMessage: Adventure's source is not in the repository; gradient, rainbow and transition follow its documentation (negative phase included). `pride` knows pride, trans, bi, pan, nb and ace.
+- The LuckPerms bridge gives the primary group only; prefixes and suffixes are not published to mods.
+- Player-name arguments of `/tab` complete online names, only for senders with `tab.tabcomplete`; the literal sub-command words are not filtered per sender. An offline name is still accepted as typed.
+- MySQL storage (`mysql.enabled`) is blind-written. Its database calls run on the server thread. Rows with unknown properties get no `checkProperty` warning.
 
 ## Licence and origin
 

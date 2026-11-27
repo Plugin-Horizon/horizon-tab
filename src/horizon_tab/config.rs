@@ -119,6 +119,8 @@ pub struct Config {
     pub ping_spoof: Option<i32>,
     pub date_format: String,
     pub time_format: String,
+    /// `placeholders.locale`, a language tag for month and day names.
+    pub locale: String,
     pub time_offset_hours: f64,
     pub register_tab_expansion: bool,
     /// `placeholder-output-replacements`: placeholder -> (output -> replacement), in order.
@@ -133,17 +135,38 @@ pub struct Config {
     pub debug: bool,
     pub mysql: MysqlConfig,
     pub unsupported: Vec<String>,
+    /// `per-world-playerlist` when enabled.
+    pub per_world: Option<crate::horizon_tab::perworld::PerWorld>,
+    /// `global-playerlist` when enabled.
+    pub global: Option<crate::horizon_tab::proxy::GlobalCfg>,
+    /// `proxy-support` when enabled.
+    pub proxy_support: Option<ProxySupportCfg>,
+    /// `layout` when enabled.
+    pub layout: Option<crate::horizon_tab::layout::LayoutCfg>,
+    /// Warnings the feature sections gave while reading (invalid slots, duplicate worlds...).
+    pub config_warnings: Vec<String>,
     /// Proxy-only keys that are switched on (`proxy-support.enabled`, `use-*`): read and ignored on a
     /// backend, so no warning, only a note at start.
     pub proxy_only_on: Vec<String>,
 }
 
 /// Keys of TAB's file that only a proxy reads. The port reads them and does nothing with them.
-pub const PROXY_ONLY_KEYS: &[&str] = &[
-    "proxy-support.enabled",
-    "use-bukkit-permissions-manager",
-    "use-online-uuid-in-tablist",
-];
+pub const PROXY_ONLY_KEYS: &[&str] = &["use-bukkit-permissions-manager", "use-online-uuid-in-tablist"];
+
+/// `proxy-support` (TAB's `ProxySupportConfiguration`): the instances' own channel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProxySupportCfg {
+    /// `PLUGIN`, `REDIS` or `RABBITMQ`.
+    pub kind: String,
+    /// `TAB_4_<channel-name-suffix>`.
+    pub channel: String,
+    pub plugin_name: String,
+    /// `proxy-support.redis.url`.
+    pub redis_url: String,
+    /// `proxy-support.rabbitmq.url` (an AMQP URI) and `.exchange`.
+    pub rabbitmq_url: String,
+    pub rabbitmq_exchange: String,
+}
 
 /// Key paths (`*` = any key) of the files TAB keeps that the port reads. `check_original` compares the
 /// original files against this list. Keep it in step with `Config::from_yaml`, `properties.rs` and `tabph.rs`.
@@ -211,9 +234,26 @@ pub const KEYS_READ: &[&str] = &[
     "permission-refresh-interval",
     "debug",
     "components.minimessage-support",
+    "placeholders.locale",
     "layout.enabled",
+    "layout.direction",
+    "layout.default-skin",
+    "layout.default-skins.*.skin",
+    "layout.default-skins.*.slots",
+    "layout.enable-remaining-players-text",
+    "layout.remaining-players-text",
+    "layout.empty-slot-ping-value",
+    "layout.layouts.*.display-condition",
+    "layout.layouts.*.default-skin",
+    "layout.layouts.*.slot-count",
+    "layout.layouts.*.fixed-slots",
+    "layout.layouts.*.groups.*.display-condition",
+    "layout.layouts.*.groups.*.slots",
     "global-playerlist.enabled",
     "per-world-playerlist.enabled",
+    "per-world-playerlist.allow-bypass-permission",
+    "per-world-playerlist.ignore-effect-in-worlds",
+    "per-world-playerlist.shared-playerlist-world-groups.*",
     "mysql.enabled",
     "mysql.host",
     "mysql.port",
@@ -222,6 +262,18 @@ pub const KEYS_READ: &[&str] = &[
     "mysql.password",
     "mysql.useSSL",
     "proxy-support.enabled",
+    "proxy-support.channel-name-suffix",
+    "proxy-support.type",
+    "proxy-support.plugin.name",
+    "proxy-support.redis.url",
+    "proxy-support.rabbitmq.exchange",
+    "proxy-support.rabbitmq.url",
+    "global-playerlist.display-others-as-spectators",
+    "global-playerlist.display-vanished-players-as-spectators",
+    "global-playerlist.isolate-unlisted-servers",
+    "global-playerlist.update-latency",
+    "global-playerlist.spy-servers",
+    "global-playerlist.server-groups.*",
     "use-bukkit-permissions-manager",
     "use-online-uuid-in-tablist",
     // groups.yml and users.yml (properties.rs, VALID_PROPERTIES)
@@ -399,6 +451,7 @@ impl Config {
                 .then(|| y.at(&["ping-spoof", "value"]).i64_or(0) as i32),
             date_format: ph.get("date-format").str_or("dd.MM.yyyy"),
             time_format: ph.get("time-format").str_or("[HH:mm:ss / h:mm a]"),
+            locale: ph.get("locale").str_or("en-US"),
             time_offset_hours: ph.get("time-offset").as_f64().unwrap_or(0.0),
             register_tab_expansion: ph.get("register-tab-expansion").bool_or(false),
             replacements,
@@ -412,6 +465,11 @@ impl Config {
             debug: y.get("debug").bool_or(false),
             mysql: MysqlConfig::from_yaml(y.get("mysql")),
             unsupported: Vec::new(),
+            per_world: None,
+            global: None,
+            proxy_support: None,
+            layout: None,
+            config_warnings: Vec::new(),
             proxy_only_on: Vec::new(),
         };
         for key in PROXY_ONLY_KEYS {
@@ -424,14 +482,40 @@ impl Config {
                 cfg.proxy_only_on.push((*key).to_owned());
             }
         }
-        for (key, what) in [
-            ("layout", "layout"),
-            ("global-playerlist", "global-playerlist"),
-            ("per-world-playerlist", "per-world-playerlist"),
-        ] {
-            if y.at(&[key, "enabled"]).bool_or(false) {
-                cfg.unsupported.push(what.to_owned());
-            }
+        if y.at(&["layout", "enabled"]).bool_or(false) {
+            let mut w = Vec::new();
+            cfg.layout = Some(crate::horizon_tab::layout::LayoutCfg::from_yaml(y.get("layout"), &mut w));
+            cfg.config_warnings.extend(w);
+        }
+        if y.at(&["per-world-playerlist", "enabled"]).bool_or(false) {
+            let mut w = Vec::new();
+            cfg.per_world = Some(crate::horizon_tab::perworld::PerWorld::from_yaml(y.get("per-world-playerlist"), &mut w));
+            cfg.config_warnings.extend(w);
+        }
+        if y.at(&["global-playerlist", "enabled"]).bool_or(false) {
+            let mut w = Vec::new();
+            cfg.global = Some(crate::horizon_tab::proxy::GlobalCfg::from_yaml(y.get("global-playerlist"), &mut w));
+            cfg.config_warnings.extend(w);
+        }
+        if y.at(&["proxy-support", "enabled"]).bool_or(false) {
+            let ps = y.get("proxy-support");
+            let kind = ps.get("type").str_or("PLUGIN").to_ascii_uppercase();
+            let kind = if ["PLUGIN", "REDIS", "RABBITMQ"].contains(&kind.as_str()) {
+                kind
+            } else {
+                cfg.config_warnings.push(format!(
+                    "Proxy support type \"{kind}\" is not supported. Supported types are: PLUGIN, REDIS, RABBITMQ. Defaulting to PLUGIN."
+                ));
+                "PLUGIN".to_owned()
+            };
+            cfg.proxy_support = Some(ProxySupportCfg {
+                kind,
+                channel: crate::horizon_tab::proxy::channel_name(&ps.get("channel-name-suffix").str_or("custom")),
+                plugin_name: ps.at(&["plugin", "name"]).str_or("RedisBungee"),
+                redis_url: ps.at(&["redis", "url"]).str_or("redis://:password@localhost:6379/0"),
+                rabbitmq_url: ps.at(&["rabbitmq", "url"]).str_or("amqp://guest:guest@localhost:5672/%2F"),
+                rabbitmq_exchange: ps.at(&["rabbitmq", "exchange"]).str_or("plugin"),
+            });
         }
         cfg
     }
@@ -491,12 +575,26 @@ mod tests {
         let y = crate::horizon_tab::yaml::parse("proxy-support:\n  enabled: true\nuse-online-uuid-in-tablist: false\nuse-bukkit-permissions-manager: true\n")
             .unwrap();
         let c = Config::from_yaml(&y);
-        assert_eq!(c.proxy_only_on, vec!["proxy-support.enabled", "use-bukkit-permissions-manager"]);
+        assert_eq!(c.proxy_only_on, vec!["use-bukkit-permissions-manager"]);
         // Inert on a backend: no "not implemented" warning.
         assert!(c.unsupported.is_empty());
-        // The shipped test config reads the same keys (proxy-support on there).
+        // The shipped test config has proxy-support on: it is read and used, not ignored.
         let c = Config::from_yaml(&crate::horizon_tab::yaml::parse(include_str!("../../data/tab/testdata/config.yml")).unwrap());
-        assert!(c.proxy_only_on.contains(&"proxy-support.enabled".to_owned()));
+        let ps = c.proxy_support.expect("proxy-support is on in the test config");
+        assert_eq!((ps.kind.as_str(), ps.channel.as_str(), ps.plugin_name.as_str()), ("PLUGIN", "TAB_4_custom", "RedisBungee"));
+        assert!(c.global.is_none(), "global-playerlist is off there");
         assert!(c.unsupported.iter().all(|u| u != "proxy-support"));
+    }
+
+    #[test]
+    fn global_playerlist_and_proxy_support_are_read() {
+        let y = crate::horizon_tab::yaml::parse(
+            "global-playerlist:\n  enabled: true\n  isolate-unlisted-servers: true\nproxy-support:\n  enabled: true\n  type: nonsense\n  channel-name-suffix: net\n",
+        )
+        .unwrap();
+        let c = Config::from_yaml(&y);
+        assert!(c.global.as_ref().is_some_and(|g| g.isolate_unlisted));
+        assert_eq!(c.proxy_support.as_ref().map(|p| (p.kind.as_str(), p.channel.as_str())), Some(("PLUGIN", "TAB_4_net")));
+        assert!(c.config_warnings.iter().any(|w| w.contains("\"NONSENSE\" is not supported")));
     }
 }

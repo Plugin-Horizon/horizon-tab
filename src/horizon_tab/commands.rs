@@ -1,14 +1,14 @@
 //! `/tab` and the toggle commands. Sub-commands, arguments, permission nodes and messages follow
 //! TAB's `TabCommand` and its sub-commands (`command/` in the shared module) and `messages.yml`
-//! (Apache-2.0, see NOTICE). `cpu` and `dump` print no report/upload: those parts of TAB are not in this port.
+//! (Apache-2.0, see NOTICE). `dump` writes a local file where TAB uploads one; nothing leaves the server.
 
 use crate::horizon_tab::engine::Engine;
 use crate::horizon_tab::integration;
 use crate::horizon_tab::out::{Out, Packet};
 use crate::horizon_tab::properties::VALID_PROPERTIES;
 
-/// The TAB version whose commands this follows (shown by `/tab`).
-const TAB_VERSION: &str = "6.2.2-SNAPSHOT";
+/// The TAB version `/tab` shows: the jar the Paper servers run.
+const TAB_VERSION: &str = "6.2.1";
 
 /// `PropertyConfiguration.VALID_PROPERTIES` in TAB's order.
 pub const COMMAND_PROPERTIES: [&str; 5] = ["tagprefix", "tagsuffix", "tabprefix", "customtabname", "tabsuffix"];
@@ -194,7 +194,7 @@ fn run(e: &mut Engine, sender: Sender, a: Vec<String>) -> Output {
         }
         "debug" => o.say("&cThe debug command was removed in favor of a new \"/tab dump <player>\" command."),
         "dump" => dump(e, rest, &mut o),
-        "cpu" => o.say("&cThis command is not part of this port."),
+        "cpu" => cpu(e, sender, &mut o),
         "mysql" => mysql(e, sender, rest, &mut o),
         "scoreboard" => scoreboard(e, sender, rest, &mut o),
         "bossbar" => bossbar(e, sender, rest, &mut o),
@@ -246,6 +246,23 @@ pub fn bossbar_toggle(e: &mut Engine, sender: Sender, args: &str) -> Output {
     let mut a = vec!["bossbar".to_owned(), "toggle".to_owned()];
     a.extend(words(args));
     run(e, sender, a)
+}
+
+/// `CpuCommand`: the first run turns tracking on, later runs print the last ten-second report.
+fn cpu(e: &mut Engine, sender: Sender, o: &mut Output) {
+    let Some(report) = e.cpu.last_report() else {
+        if e.cpu.enable(e.now_ms()) {
+            o.say("&aCPU usage tracking has been enabled. Run the command again in 10 seconds to see the first results.");
+        } else {
+            o.say("&cPlease wait at least 10 seconds since running the command for the first time.");
+        }
+        return;
+    };
+    let ph = &e.ph;
+    let lines = crate::horizon_tab::cpu::lines(&report, matches!(sender, Sender::Console), &|t| ph.refresh_info(t));
+    for l in lines {
+        o.say(l);
+    }
 }
 
 /// `ReloadCommand`: TAB's answer is `reload-success`, or `reload-fail-file` naming a broken file.
@@ -313,7 +330,9 @@ fn parse(e: &mut Engine, sender: Sender, a: &[String], o: &mut Output) {
     o.say(format!("&3Output length: &e{} &3characters", parsed.encode_utf16().count()));
 }
 
-/// `DumpCommand` without the upload: the facts it collects about the player, printed here.
+/// `DumpCommand`: the facts about the player, the server and the files, written to a file in
+/// `plugins/TAB/dump/`. TAB uploads the dump to a paste service and sends the link; this port
+/// uploads nothing (the dump holds player names, ids and the config), so the file stays local.
 fn dump(e: &mut Engine, a: &[String], o: &mut Output) {
     let Some(name) = a.first() else {
         return o.say("&cUsage: /tab dump <player>");
@@ -321,37 +340,147 @@ fn dump(e: &mut Engine, a: &[String], o: &mut Output) {
     let Some(i) = e.find(name) else {
         return player_not_online(e, o, name);
     };
-    o.say("&eDump (uploading is not part of this port, the data is printed instead):");
-    o.say(format!("&6Integrations: &f{}", {
-        let n = integration::names();
-        if n.is_empty() {
-            "none (operators have all permissions)".to_owned()
-        } else {
-            n.join(", ")
+    let text = build_dump(e, i);
+    let file = format!("{}-{}.txt", e.tab_player(i).p.name, e.now_ms());
+    let dir = e.dir.join("dump");
+    let written = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join(&file), &text));
+    match written {
+        Ok(()) => {
+            o.say(format!("&aDump written to &eplugins/TAB/dump/{file}"));
+            o.say("&7Nothing was uploaded; the file stays on this server.");
         }
-    }));
-    o.say(format!(
-        "&6Placeholder expansions: &f{}",
-        crate::horizon_tab::placeholders::identifiers().join(", ")
-    ));
-    let tp = e.tab_player(i).clone();
-    o.say(format!(
-        "&6Player: &f{}  &6group: &f{}  &6world: &f{}",
-        tp.p.name, tp.group, tp.p.world
-    ));
-    if e.cfg.teams.enabled {
-        o.say(format!(
-            "&6Team name: &f{}",
-            e.team_of(i).unwrap_or_default().replace('\0', "\\0")
-        ));
-        for (line, v) in e.sort_values(i) {
-            o.say(format!("&6Sorting {line}: &f{v}"));
+        Err(err) => {
+            eprintln!("[tab] Failed to write dump: {err}");
+            o.say("&cAn error occurred while writing the dump, check console for more info.");
         }
     }
+}
+
+/// The dump text (YAML-like sections, as TAB's dump has: platform, player, features, minimessage,
+/// placeholders, files).
+pub fn build_dump(e: &mut Engine, i: usize) -> String {
+    let tp = e.tab_player(i).clone();
+    let mut s = String::new();
+    s.push_str("platform:\n");
+    s.push_str(&format!("  tab version: {TAB_VERSION}\n  server: Horizon (Minecraft 26.3)\n"));
+    let n = integration::names();
+    s.push_str(&format!("  integrations: {}\n", if n.is_empty() { "none".to_owned() } else { n.join(", ") }));
+    s.push_str("player:\n");
+    s.push_str(&format!(
+        "  name: {}\n  uuid: {}\n  group: {}\n  world: {}\n  game mode: {}\n  ping: {}\n  client version: {} ({})\n  bedrock: {}\n  vanished: {}\n",
+        tp.p.name,
+        crate::horizon_tab::placeholders::uuid_string(tp.p.uuid),
+        tp.group,
+        tp.p.world,
+        tp.p.game_mode,
+        tp.p.ping,
+        tp.version_name,
+        tp.version_id,
+        tp.bedrock,
+        tp.p.vanished
+    ));
     for p in COMMAND_PROPERTIES {
         let (v, source) = e.property_of(i, p);
-        o.say(format!("&6{p}: &r{v} &8(source: {source})"));
+        s.push_str(&format!("  {p}: '{v}' (source: {source})\n"));
     }
+    if e.cfg.teams.enabled {
+        s.push_str(&format!("  team name: {}\n", e.team_of(i).unwrap_or_default().replace('\0', "\\0")));
+        for (line, v) in e.sort_values(i) {
+            s.push_str(&format!("  sorting {line}: {v}\n"));
+        }
+    }
+    s.push_str("features:\n");
+    let c = &e.cfg;
+    let on = |b: bool| if b { "enabled" } else { "Feature is disabled" };
+    for (name, enabled) in [
+        ("HeaderFooter", c.header_footer.enabled),
+        ("PlayerList", c.tablist_names.enabled),
+        ("NameTags", c.teams.enabled),
+        ("PlayerListObjective", c.list_objective.enabled),
+        ("BelowName", c.belowname.enabled),
+        ("Scoreboard", c.scoreboard.enabled),
+        ("BossBar", c.bossbar.enabled),
+        ("SpectatorFix", c.prevent_spectator_effect),
+        ("PingSpoof", c.ping_spoof.is_some()),
+        ("Layout", c.layout.is_some()),
+        ("PerWorldPlayerList", c.per_world.is_some()),
+        ("GlobalPlayerList", c.global.is_some()),
+        ("ProxySupport", c.proxy_support.is_some()),
+    ] {
+        s.push_str(&format!("  {name}: {}\n", on(enabled)));
+    }
+    s.push_str(&format!(
+        "proxy:\n  players of other TAB instances: {}\n  bridge links (tab:bridge-6): {}\n",
+        e.proxy.players.len(),
+        e.bridge.players.len()
+    ));
+    s.push_str("minimessage:\n");
+    s.push_str(&format!("  support is enabled in config: {}\n", c.minimessage));
+    s.push_str("  MiniMessage module: built in (colours, decorations, gradients, rainbow, transition, click, hover, font, insertion, key, lang, selector, score, nbt)\n");
+    s.push_str("placeholders:\n");
+    s.push_str(&format!(
+        "  expansions: {}\n  locale: {}\n",
+        crate::horizon_tab::placeholders::identifiers().join(", "),
+        c.locale
+    ));
+    s.push_str("files:\n");
+    for file in ["config.yml", "groups.yml", "users.yml", "animations.yml"] {
+        let text = std::fs::read_to_string(e.dir.join(file)).unwrap_or_default();
+        let text = match file {
+            "config.yml" => censor_config(&text),
+            "groups.yml" | "users.yml" if e.cfg.mysql.enabled => {
+                "MySQL connection enabled, rows are in the database".to_owned()
+            }
+            _ => text,
+        };
+        s.push_str(&format!("  {file}: |\n"));
+        for line in text.lines() {
+            s.push_str(&format!("    {line}\n"));
+        }
+    }
+    s
+}
+
+/// `DumpCommand.censorConfig`: the MySQL connection values and the proxy-support URLs become
+/// `*CENSORED*`, line by line, so the rest of the file stays as it is.
+pub fn censor_config(text: &str) -> String {
+    let mut out = Vec::new();
+    // (indent, key) of the open sections.
+    let mut open: Vec<(usize, String)> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+            out.push(line.to_owned());
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        while open.last().is_some_and(|(i, _)| *i >= indent) {
+            open.pop();
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            out.push(line.to_owned());
+            continue;
+        };
+        let key = key.trim().to_owned();
+        if value.trim().is_empty() {
+            open.push((indent, key));
+            out.push(line.to_owned());
+            continue;
+        }
+        let parent = open.last().map(|(_, k)| k.as_str()).unwrap_or("");
+        let secret = (parent == "mysql" && matches!(key.as_str(), "host" | "database" | "username" | "password"))
+            || (matches!(parent, "redis" | "rabbitmq") && key == "url");
+        if secret {
+            out.push(format!("{}{key}: '*CENSORED*'", " ".repeat(indent)));
+        } else {
+            out.push(line.to_owned());
+        }
+    }
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
 }
 
 /// `MySQLCommand`: `upload` and `download` after the permission check. Without a database connection
@@ -922,7 +1051,6 @@ fn nametag(e: &mut Engine, sender: Sender, a: &[String], o: &mut Output) {
     let args = &a[1..];
     let silent = args.last().is_some_and(|s| s == "-s");
     let eff = if silent { &args[..args.len() - 1] } else { args };
-    let unsupported = "&cNametag opacity (line-of-sight checks) is not part of this port.";
     match action.as_str() {
         "show" | "opaque" | "hide" | "toggle" => {
             let player = if let Some(n) = eff.first() {
@@ -960,7 +1088,13 @@ fn nametag(e: &mut Engine, sender: Sender, a: &[String], o: &mut Output) {
                 return no_permission(e, o);
             }
             if action == "opaque" {
-                return o.say(unsupported);
+                e.set_opaque(player, viewer);
+                if !silent {
+                    let uuid = e.tab_player(player).p.uuid;
+                    let msg = e.message("nametag.opaque-player-enabled", "&aYour nametag will no longer be visible through walls");
+                    tell(e, sender, o, uuid, msg);
+                }
+                return;
             }
             let hidden = e.nametag_target(player, viewer, &action);
             if !silent {
@@ -994,13 +1128,26 @@ fn nametag(e: &mut Engine, sender: Sender, a: &[String], o: &mut Output) {
             if !has(sender, node) {
                 return no_permission(e, o);
             }
+            if action == "opaqueview" {
+                e.set_opaque_view(viewer, true);
+                if !silent {
+                    let msg = e.message(
+                        "nametag.opaque-view-enabled",
+                        "&aYou will no longer see nametags of players behind walls",
+                    );
+                    tell(e, sender, o, uuid, msg);
+                }
+                return;
+            }
             let hidden_now = e.nametag_view_is_hidden(viewer);
             let want_hidden = match action.as_str() {
                 "showview" => false,
                 "hideview" => true,
                 "toggleview" => !hidden_now,
-                _ => return o.say(unsupported),
+                _ => return,
             };
+            // These end the opaque view even when the tags already are that way.
+            e.set_opaque_view(viewer, false);
             // Nothing happens (and nothing is said) when it already is that way.
             if want_hidden == hidden_now {
                 return;
@@ -1060,6 +1207,38 @@ mod tests {
             vec![p],
         );
         e
+    }
+
+    #[test]
+    fn the_dump_censors_the_connection_and_names_the_features() {
+        let mut e = engine();
+        let text = build_dump(&mut e, 0);
+        assert!(text.contains("  name: Steve\n"));
+        assert!(text.contains("minimessage:\n  support is enabled in config: true"));
+        assert!(text.contains("  Layout: Feature is disabled\n"));
+        let cfg = "mysql:\n  enabled: false\n  host: db.internal\n  port: 3306\n  database: tab\n  username: u\n  password: p\nproxy-support:\n  redis:\n    url: redis://x\n  type: PLUGIN\nhost: keep\n";
+        let out = censor_config(cfg);
+        assert!(out.contains("  host: '*CENSORED*'\n") && out.contains("  password: '*CENSORED*'\n"));
+        assert!(out.contains("    url: '*CENSORED*'\n"));
+        assert!(out.contains("  port: 3306\n") && out.contains("  type: PLUGIN\n") && out.contains("\nhost: keep\n"));
+        assert!(!out.contains("db.internal") && !out.contains("redis://x"));
+    }
+
+    #[test]
+    fn tab_shows_the_version_of_the_paper_jar() {
+        // Paper: "TAB v6.2.1" heads the help menu.
+        let mut e = engine();
+        let o = tab(&mut e, Sender::Console, "");
+        assert_eq!(o.replies[0], "&3TAB v6.2.1");
+    }
+
+    #[test]
+    fn cpu_enables_tracking_then_waits() {
+        let mut e = engine();
+        let o = tab(&mut e, Sender::Console, "cpu");
+        assert!(o.replies[0].contains("tracking has been enabled"));
+        let o = tab(&mut e, Sender::Console, "cpu");
+        assert!(o.replies[0].contains("wait at least 10 seconds"));
     }
 
     #[test]
@@ -1134,5 +1313,23 @@ mod tests {
         // Already hidden: nothing happens.
         let o = tab(&mut e, Sender::Console, "nametag hideview Steve");
         assert!(o.packets.is_empty());
+    }
+
+    #[test]
+    fn a_help_menu_with_click_and_hover_reaches_the_player_as_components() {
+        let mut e = engine();
+        e.messages = yaml::parse(
+            "help-menu:\n  - '<click:run_command:/tab reload><hover:show_text:''<red>Reloads the plugin''>/tab reload</hover></click>'\n  - '&7plain line'\n",
+        )
+        .unwrap();
+        let o = tab(&mut e, Sender::Console, "help");
+        // The version line, then one reply per help-menu line.
+        assert_eq!(o.replies.len(), 3, "{:?}", o.replies);
+        let c = crate::horizon_tab::text::component(&o.replies[1], e.cfg.minimessage);
+        assert_eq!(c["click_event"], serde_json::json!({ "action": "run_command", "command": "/tab reload" }));
+        assert_eq!(c["hover_event"]["action"], "show_text");
+        assert_eq!(c["hover_event"]["value"]["text"], "Reloads the plugin");
+        let plain = crate::horizon_tab::text::component(&o.replies[2], e.cfg.minimessage);
+        assert!(plain.get("click_event").is_none());
     }
 }

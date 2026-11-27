@@ -61,7 +61,7 @@ impl Color {
             }
         }
     }
-    fn json(self) -> Value {
+    pub(crate) fn json(self) -> Value {
         match self {
             Color::Legacy(i) => Value::from(LEGACY[i as usize].1),
             Color::Rgb(c) => Value::from(format!("#{c:06X}")),
@@ -107,7 +107,7 @@ pub fn colorize(text: &str) -> String {
     out
 }
 
-fn parse_hex(s: &str) -> Option<u32> {
+pub(crate) fn parse_hex(s: &str) -> Option<u32> {
     if s.len() == 6 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
         u32::from_str_radix(s, 16).ok()
     } else {
@@ -116,7 +116,7 @@ fn parse_hex(s: &str) -> Option<u32> {
 }
 
 /// Interpolates `colors` over `n` characters.
-fn gradient_colors(colors: &[u32], n: usize) -> Vec<u32> {
+pub(crate) fn gradient_colors(colors: &[u32], n: usize) -> Vec<u32> {
     if n == 0 {
         return Vec::new();
     }
@@ -340,6 +340,14 @@ fn replace_rgb_forms(text: &str) -> String {
     s
 }
 
+/// TAB's own formats (`&` codes, RGB forms, TAB gradients) turned into `§` codes, the step
+/// that runs before MiniMessage in TAB (`RGBUtils`).
+pub(crate) fn prepare(text: &str) -> String {
+    let text = colorize(text);
+    let text = replace_gradients(&text, false);
+    replace_rgb_forms(&text)
+}
+
 /// Parses TAB-formatted text into styled spans.
 pub fn spans(text: &str, minimessage: bool) -> Vec<Span> {
     let text = colorize(text);
@@ -515,7 +523,7 @@ fn canonical_tag(name: &str) -> Option<String> {
     )
 }
 
-fn mm_color_opt(name: &str) -> Option<Color> {
+pub(crate) fn mm_color_opt(name: &str) -> Option<Color> {
     if let Some(h) = name.strip_prefix('#') {
         return parse_hex(h).map(Color::Rgb);
     }
@@ -549,6 +557,9 @@ fn span_json(span: &Span) -> Value {
 
 /// TAB-formatted text as a vanilla chat component (JSON).
 pub fn component(text: &str, minimessage: bool) -> Value {
+    if minimessage && crate::horizon_tab::mm::needs_full(text) {
+        return crate::horizon_tab::mm::component(text);
+    }
     let spans = spans(text, minimessage);
     match spans.as_slice() {
         [] => json!({ "text": "" }),
@@ -559,6 +570,9 @@ pub fn component(text: &str, minimessage: bool) -> Value {
 
 /// The text without any formatting.
 pub fn plain(text: &str, minimessage: bool) -> String {
+    if minimessage && crate::horizon_tab::mm::needs_full(text) {
+        return crate::horizon_tab::mm::plain(text);
+    }
     spans(text, minimessage).into_iter().map(|s| s.text).collect()
 }
 

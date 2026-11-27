@@ -1,4 +1,5 @@
 # hmod port: tab
+Round 4 (2026-11-25, blind, not compiled): new modules `mm.rs` (full MiniMessage), `cpu.rs` (`/tab cpu`), `layout.rs` and `perworld.rs` (config, slot assignment, world groups), `listpacket.rs` (player-info packets as bytes); engine: layout and per-world sections of `update_viewer`, opaque name tags (`opaque_pairs` / `set_occlusion`, line of sight asked by `lib.rs` every 250 ms), nick compatibility (`set_entry_name`, team members and score owners follow the entry name the guard reads from an entry-add packet), `placeholders.locale` in `datefmt.rs`, `/tab dump` as a local file with the connection values censored. Unit tests carry literal values (rainbow hues, gradient steps, slot translation, packet layout, CPU percentages, regex patterns).
 Parity: 37% -> 40% now (42 -> 46 of 115 items) / ~53% -> ~57% with our PRs (MySQL adds 4 items: `/tab mysql upload`, `/tab mysql download`, the storage feature, the `mysql` section's keys; hand count, as before). Blind round 100, NOT compiled. Earlier rounds below.
 
 Round 100 (HUNDRED, blind, not compiled): MySQL storage
@@ -53,3 +54,12 @@ Round 3 (blind, not compiled)
   `MySQLUserConfiguration`/`MySQLGroupConfiguration`) and the upload/download commands; the port's config is file-only, and
   the work was too large to write blind. `/tab mysql` stays the message-only answer (`mysql-fail-not-enabled`). The `mysql`
   crate is already used by husksync, so a later round can build on it.
+
+## Round 2 (2026-11-25)
+
+The `horizon_main_api`, `horizon_protocol_api` and `horizon_team_options_api` features are gone: their code is the normal code
+(the notes above describe how it started). Teams are now per-viewer `set_player_team` packets (`team_packet_body` +
+`player_send_packet`), so the world's scoreboard is untouched and options bit 2 (see friendly invisibles) works; list names use
+`player_set_list_name_for`; the list and below-name slots use `player_set_display_score`; the guard is `guard.rs` with
+`watch_outgoing_packets` + `server_packet`; `/bossbar` is answered in `player_command`; `HostGroups` feeds the primary group
+from `permission_groups`. Written blind, not compiled yet.

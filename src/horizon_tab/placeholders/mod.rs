@@ -88,6 +88,11 @@ pub struct Server {
     pub version: String,
     /// The world folder (`level-name`).
     pub level_name: String,
+    /// The players other TAB instances told this one about (`proxy-support`), as the counting
+    /// placeholders see them.
+    pub proxy_players: Vec<crate::horizon_tab::proxy::ProxyBrief>,
+    /// `global-playerlist` when enabled: the server groups `%playerlist-group_<group>%` counts.
+    pub global: Option<crate::horizon_tab::proxy::GlobalCfg>,
 }
 
 /// What a mod registers.

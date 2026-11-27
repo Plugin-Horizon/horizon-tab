@@ -114,6 +114,15 @@ pub fn guard_team(viewer: u128, team: &str, players: &[String]) -> bool {
     guard.as_ref().is_some_and(|s| s.engine.guard_team(viewer, team, players))
 }
 
+/// Whether any part of the guard is on (name tag teams, ping spoof, spectator fix), so the glue
+/// has the engine hold the watched packets only when TAB would use them.
+pub fn guard_needed() -> bool {
+    let guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().is_some_and(|s| {
+        s.engine.cfg.teams.enabled || s.engine.cfg.ping_spoof.is_some() || s.engine.cfg.prevent_spectator_effect
+    })
+}
+
 /// The latency TAB's ping spoof shows, if it is on.
 pub fn guard_latency() -> Option<i32> {
     let guard = state().lock().unwrap_or_else(|e| e.into_inner());
@@ -131,6 +140,31 @@ pub fn guard_game_mode(viewer: u128, uuid: u128, mode: i32) -> Option<i32> {
 pub fn guard_display_name(viewer: u128, uuid: u128) -> Option<Value> {
     let guard = state().lock().unwrap_or_else(|e| e.into_inner());
     guard.as_ref().and_then(|s| s.engine.guard_display_name(viewer, uuid))
+}
+
+/// An entry-add packet to `viewer` carries a profile name for `uuid` (a nick plugin's rename):
+/// the teams and scores name the new entry from the next tick on.
+pub fn guard_entry_name(viewer: u128, uuid: u128, name: &str) {
+    if let Some(s) = state().lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if s.engine.set_entry_name(viewer, uuid, name) {
+            s.engine.debug_note(&format!("Processing name change of player {uuid:032x} to {name}"));
+        }
+    }
+}
+
+/// The (viewer, target) pairs whose line of sight the opaque name tag mode needs this round.
+pub fn opaque_pairs() -> Vec<(u128, u128)> {
+    match state().lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        Some(s) => s.engine.opaque_pairs(),
+        None => Vec::new(),
+    }
+}
+
+/// The game's line-of-sight answers for those pairs.
+pub fn set_occlusion(results: &[(u128, u128, bool)]) {
+    if let Some(s) = state().lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        s.engine.set_occlusion(results);
+    }
 }
 
 /// `viewer` respawned: forget what their client holds from us, so the next tick sends it again.
@@ -288,6 +322,45 @@ pub fn tick(now_ms: i64, server: Server, players: Vec<PlayerIn>) -> Vec<Packet> 
         *tab_values().write().unwrap_or_else(|e| e.into_inner()) = values;
     }
     packets
+}
+
+/// One `proxy-support` message (Base64) a transport received from the channel [`proxy_channel`] names.
+pub fn proxy_message(raw: &str) {
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = guard.as_mut() {
+        s.engine.proxy_receive(raw);
+    }
+}
+
+/// `(type, channel name, broker url, rabbitmq exchange)` of the `proxy-support` feature, None when it is off.
+/// The URL is the Redis or RabbitMQ one, by type.
+pub fn proxy_config() -> Option<(String, String, String, String)> {
+    let guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    let c = guard.as_ref()?.engine.cfg.proxy_support.as_ref()?;
+    let url = if c.kind == "RABBITMQ" { c.rabbitmq_url.clone() } else { c.redis_url.clone() };
+    Some((c.kind.clone(), c.channel.clone(), url, c.rabbitmq_exchange.clone()))
+}
+
+/// The `proxy-support` channel and the messages to send on it (None: the feature is off).
+pub fn proxy_outbox() -> Option<(String, Vec<String>)> {
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_mut()?.engine.proxy_outbox()
+}
+
+/// One `tab:bridge-6` message from TAB on the proxy for a player's connection. Scoreboard messages
+/// answer with packets (sent with the next tick's); the answers wait in [`bridge_outbox`].
+pub fn bridge_message(player: u128, bytes: &[u8]) {
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = guard.as_mut() {
+        let packets = s.engine.bridge_receive(player, bytes);
+        s.pending.extend(packets);
+    }
+}
+
+/// The `(player, bytes)` answers for the proxy's TAB, to send on `tab:bridge-6`.
+pub fn bridge_outbox() -> Vec<(u128, Vec<u8>)> {
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_mut().map(|s| s.engine.bridge_outbox()).unwrap_or_default()
 }
 
 /// The display name for the game's own player info entry of `uuid`, when TAB formats it.
